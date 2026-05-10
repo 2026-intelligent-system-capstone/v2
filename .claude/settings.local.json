@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk ls *)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "WebSearch",
+      "Bash(rtk grep *)",
+      "Bash(rtk find *)",
+      "Bash(rtk git *)",
+      "Bash(rtk uv *)",
+      "Bash(uv run *)"
+    ]
+  }
+}
