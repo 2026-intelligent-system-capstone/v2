@@ -1,3 +1,4 @@
+import json
 from collections import Counter
 from pathlib import PurePosixPath
 
@@ -7,6 +8,9 @@ from services.api.app.project_evaluations.analysis.prompts import (
     build_context_prompt,
 )
 from services.api.app.project_evaluations.persistence.models import ProjectArtifactRow
+from services.api.app.project_evaluations.rag.chunk_models import ChunkRecord
+from services.api.app.project_evaluations.rag.redaction import redact_sensitive_text
+from services.api.app.project_evaluations.rag.splitters import split_artifact
 
 ROOT_DOC_NAMES = {
     "claude.md",
@@ -19,43 +23,19 @@ ROOT_DOC_NAMES = {
     "requirements.txt",
 }
 
-TECH_BY_EXTENSION = {
-    ".py": "Python",
-    ".js": "JavaScript",
-    ".jsx": "React",
-    ".ts": "TypeScript",
-    ".tsx": "React/TypeScript",
-    ".java": "Java",
-    ".kt": "Kotlin",
-    ".go": "Go",
-    ".rs": "Rust",
-    ".sql": "SQL",
-    ".html": "HTML",
-    ".css": "CSS",
-    ".toml": "TOML 설정",
-    ".yaml": "YAML 설정",
-    ".yml": "YAML 설정",
-    ".json": "JSON 설정",
-}
-RISK_KEYWORDS = ("TODO", "FIXME", "error", "exception", "security", "hack")
-
-
 def build_project_context(
     artifacts: list[ProjectArtifactRow], llm: LlmClient | None = None
 ) -> dict[str, object]:
     extracted = [a for a in artifacts if a.raw_text.strip()]
-    if llm and llm.enabled():
-        try:
-            return _build_with_llm(extracted, llm)
-        except Exception:
-            pass
-    return _build_rule_based(extracted)
+    if llm is None or not llm.enabled():
+        raise RuntimeError("프로젝트 context 생성에 필요한 LLM client가 비활성화되었습니다. OPENAI_API_KEY와 분석 모델 설정을 확인하세요.")
+    return _build_with_llm(extracted, llm)
 
 
 def _build_with_llm(
     artifacts: list[ProjectArtifactRow], llm: LlmClient
 ) -> dict[str, object]:
-    snippets = [f"[{a.source_path}]\n{a.raw_text[:1500]}" for a in artifacts[:20]]
+    snippets = _representative_snippets(artifacts)
     messages = build_context_prompt(snippets)
     result: ProjectContextSchema = llm.parse(messages, ProjectContextSchema, max_tokens=4000)
     areas = [
@@ -63,7 +43,7 @@ def _build_with_llm(
             "name": area.name,
             "summary": area.summary,
             "confidence": area.confidence,
-            "source_refs": _match_source_refs(area.name, artifacts),
+            "source_refs": _match_source_refs(area.name, artifacts) or _representative_source_refs(artifacts),
         }
         for area in result.areas
     ]
@@ -79,6 +59,134 @@ def _build_with_llm(
     }
 
 
+def _representative_snippets(
+    artifacts: list[ProjectArtifactRow], max_snippets: int = 24
+) -> list[str]:
+    chunks = [
+        chunk
+        for artifact in _select_representative_artifacts(artifacts, max_items=max_snippets)
+        for chunk in split_artifact("context-preview", artifact)
+    ]
+    selected = _select_representative_chunks(chunks, max_items=max_snippets)
+    if not selected:
+        raise RuntimeError("프로젝트 context 생성에 사용할 splitter chunk가 없습니다. artifact role 분류와 텍스트 추출 결과를 확인하세요.")
+    return [_format_context_chunk(chunk) for chunk in selected]
+
+
+def _select_representative_chunks(
+    chunks: list[ChunkRecord], max_items: int
+) -> list[ChunkRecord]:
+    ranked = sorted(chunks, key=_chunk_priority)
+    selected: list[ChunkRecord] = []
+    role_counts: Counter[str] = Counter()
+    path_counts: Counter[str] = Counter()
+    for chunk in ranked:
+        if role_counts[chunk.artifact_role] >= 6 or path_counts[chunk.source_path] >= 3:
+            continue
+        selected.append(chunk)
+        role_counts[chunk.artifact_role] += 1
+        path_counts[chunk.source_path] += 1
+        if len(selected) >= max_items:
+            break
+    return selected
+
+
+def _chunk_priority(chunk: ChunkRecord) -> tuple[int, int, str, int]:
+    type_priority = {
+        "file_manifest": 0,
+        "code_symbol": 1,
+        "project_document_semantic": 2,
+        "codebase_overview": 3,
+        "structured_config": 4,
+        "code_raw": 5,
+    }.get(chunk.chunk_type.value, 6)
+    role_priority = {
+        "codebase_overview": 0,
+        "project_report": 1,
+        "project_presentation": 2,
+        "project_design_doc": 3,
+        "project_description": 4,
+        "codebase_source": 5,
+        "codebase_test": 6,
+        "codebase_api_spec": 7,
+        "codebase_config": 8,
+    }.get(chunk.artifact_role, 9)
+    return (role_priority, type_priority, chunk.source_path, chunk.chunk_index)
+
+
+def _format_context_chunk(chunk: ChunkRecord) -> str:
+    label_parts = [redact_sensitive_text(chunk.source_path)]
+    if chunk.line_start is not None and chunk.line_end is not None:
+        label_parts.append(f"L{chunk.line_start}-L{chunk.line_end}")
+    elif chunk.page_number is not None:
+        label_parts.append(f"page {chunk.page_number}")
+    elif chunk.slide_number is not None:
+        label_parts.append(f"slide {chunk.slide_number}")
+    label = ":".join(label_parts)
+    return (
+        f"[{chunk.artifact_role} | {chunk.chunk_type.value} | {label}]\n"
+        f"{redact_sensitive_text(chunk.text)[:1500]}"
+    )
+
+
+def _select_representative_artifacts(
+    artifacts: list[ProjectArtifactRow], max_items: int
+) -> list[ProjectArtifactRow]:
+    ranked = sorted(artifacts, key=_artifact_priority)
+    selected: list[ProjectArtifactRow] = []
+    role_counts: Counter[str] = Counter()
+    area_counts: Counter[str] = Counter()
+    for artifact in ranked:
+        role = _artifact_role(artifact)
+        area = _area_name_for_path(artifact.source_path) or "project-docs"
+        if role_counts[role] >= 5 or area_counts[area] >= 4:
+            continue
+        selected.append(artifact)
+        role_counts[role] += 1
+        area_counts[area] += 1
+        if len(selected) >= max_items:
+            break
+    if len(selected) < min(max_items, len(ranked)):
+        seen = {artifact.id for artifact in selected}
+        for artifact in ranked:
+            if artifact.id in seen:
+                continue
+            selected.append(artifact)
+            if len(selected) >= max_items:
+                break
+    return selected
+
+
+def _artifact_priority(artifact: ProjectArtifactRow) -> tuple[int, str, str]:
+    role_priority = {
+        "codebase_overview": 0,
+        "project_report": 1,
+        "project_presentation": 2,
+        "project_design_doc": 3,
+        "project_description": 4,
+        "codebase_source": 5,
+        "codebase_test": 6,
+        "codebase_api_spec": 7,
+        "codebase_config": 8,
+    }.get(_artifact_role(artifact), 9)
+    return (role_priority, _area_name_for_path(artifact.source_path) or "", artifact.source_path)
+
+
+def _artifact_role(artifact: ProjectArtifactRow) -> str:
+    metadata = _metadata(artifact)
+    role = metadata.get("artifact_role")
+    return str(role) if role else "unknown"
+
+
+def _metadata(artifact: ProjectArtifactRow) -> dict[str, object]:
+    raw = artifact.metadata_json or "{}"
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _match_source_refs(area_name: str, artifacts: list[ProjectArtifactRow]) -> list[dict]:
     keyword = area_name.lower()
     matched = [
@@ -86,189 +194,28 @@ def _match_source_refs(area_name: str, artifacts: list[ProjectArtifactRow]) -> l
         for a in artifacts
         if keyword in a.source_path.lower() or keyword in a.raw_text.lower()[:500]
     ]
+    return _source_refs_for_artifacts(matched[:3])
+
+
+def _representative_source_refs(artifacts: list[ProjectArtifactRow]) -> list[dict]:
+    ranked = sorted(artifacts, key=_source_ref_priority_for_artifact)
+    return _source_refs_for_artifacts(ranked[:3])
+
+
+def _source_refs_for_artifacts(artifacts: list[ProjectArtifactRow]) -> list[dict]:
     return [
         {
-            "path": a.source_path,
-            "snippet": _normalize(a.raw_text)[:200],
+            "path": redact_sensitive_text(a.source_path),
+            "snippet": redact_sensitive_text(_normalize(a.raw_text))[:240],
             "artifact_id": a.id,
+            "artifact_role": _artifact_role(a),
         }
-        for a in matched[:3]
-    ]
-
-
-def _build_rule_based(artifacts: list[ProjectArtifactRow]) -> dict[str, object]:
-    summary = _build_summary(artifacts)
-    tech_stack = _infer_tech_stack(artifacts)
-    features = _infer_features(artifacts)
-    architecture_notes = _infer_architecture(artifacts)
-    data_flow = _infer_data_flow(artifacts)
-    risk_points = _infer_risk_points(artifacts)
-    areas = _infer_project_areas(artifacts)
-    question_targets = [area["name"] for area in areas]
-    return {
-        "summary": summary,
-        "tech_stack": tech_stack,
-        "features": features,
-        "architecture_notes": architecture_notes,
-        "data_flow": data_flow,
-        "risk_points": risk_points,
-        "question_targets": question_targets,
-        "areas": areas,
-    }
-
-
-def _build_summary(artifacts: list[ProjectArtifactRow]) -> str:
-    preferred = sorted(
-        artifacts,
-        key=lambda item: (
-            "readme" not in item.source_path.lower(),
-            item.source_type != "document",
-            item.source_path,
-        ),
-    )
-    snippets = []
-    for artifact in preferred[:3]:
-        text = _normalize(artifact.raw_text)[:700]
-        if text:
-            snippets.append(f"{artifact.source_path}: {text}")
-    if not snippets:
-        return "업로드된 자료에서 추출 가능한 텍스트가 거의 없습니다."
-    return "\n\n".join(snippets)
-
-
-def _infer_tech_stack(artifacts: list[ProjectArtifactRow]) -> list[str]:
-    found = []
-    lowered_text = "\n".join(a.raw_text.lower()[:2000] for a in artifacts)
-    for artifact in artifacts:
-        suffix = PurePosixPath(artifact.source_path).suffix.lower()
-        if suffix in TECH_BY_EXTENSION:
-            found.append(TECH_BY_EXTENSION[suffix])
-    keyword_map = {
-        "fastapi": "FastAPI",
-        "streamlit": "Streamlit",
-        "sqlite": "SQLite",
-        "react": "React",
-        "next.js": "Next.js",
-        "qdrant": "Qdrant",
-        "openai": "OpenAI API",
-        "sqlalchemy": "SQLAlchemy",
-    }
-    for keyword, label in keyword_map.items():
-        if keyword in lowered_text:
-            found.append(label)
-    return sorted(set(found))[:12]
-
-
-def _infer_features(artifacts: list[ProjectArtifactRow]) -> list[str]:
-    candidates = []
-    for artifact in artifacts:
-        path = PurePosixPath(artifact.source_path)
-        if path.stem.lower() in {"readme", "requirements", "pyproject", "package"}:
-            continue
-        if len(path.parts) > 1:
-            candidates.append(path.parts[0])
-        candidates.append(path.stem.replace("_", " ").replace("-", " "))
-    counter = Counter(item for item in candidates if item and len(item) > 2)
-    return [name for name, _ in counter.most_common(8)]
-
-
-def _infer_architecture(artifacts: list[ProjectArtifactRow]) -> list[str]:
-    top_dirs = Counter(
-        PurePosixPath(a.source_path).parts[0]
         for a in artifacts
-        if len(PurePosixPath(a.source_path).parts) > 1
-    )
-    notes = [
-        f"`{name}/` 디렉터리에 주요 코드가 집중되어 있습니다."
-        for name, _ in top_dirs.most_common(5)
     ]
-    if any("api" in a.source_path.lower() for a in artifacts):
-        notes.append("API 계층으로 보이는 파일이 포함되어 있습니다.")
-    if any("test" in a.source_path.lower() for a in artifacts):
-        notes.append("테스트 또는 검증 관련 파일이 포함되어 있습니다.")
-    return notes
 
 
-def _infer_data_flow(artifacts: list[ProjectArtifactRow]) -> list[str]:
-    flow = []
-    if any("upload" in a.raw_text.lower() for a in artifacts):
-        flow.append("업로드 입력을 처리하는 흐름이 자료에 나타납니다.")
-    if any(
-        "database" in a.raw_text.lower() or "sql" in a.source_path.lower()
-        for a in artifacts
-    ):
-        flow.append("데이터 저장소와 연결되는 흐름이 자료에 나타납니다.")
-    if any("report" in a.raw_text.lower() for a in artifacts):
-        flow.append("분석 결과를 리포트로 생성하는 흐름이 자료에 나타납니다.")
-    return flow or ["파일 구조와 문서 설명을 기반으로 세부 데이터 흐름 확인이 필요합니다."]
-
-
-def _infer_risk_points(artifacts: list[ProjectArtifactRow]) -> list[str]:
-    risks = []
-    for artifact in artifacts:
-        text = artifact.raw_text
-        for keyword in RISK_KEYWORDS:
-            if keyword.lower() in text.lower():
-                risks.append(
-                    f"{artifact.source_path}에서 `{keyword}` 관련 확인 지점이 발견되었습니다."
-                )
-                break
-    return risks[:8]
-
-
-def _infer_project_areas(
-    artifacts: list[ProjectArtifactRow],
-) -> list[dict[str, object]]:
-    groups: dict[str, list[ProjectArtifactRow]] = {}
-    root_docs: list[ProjectArtifactRow] = []
-    for artifact in artifacts:
-        area_name = _area_name_for_path(artifact.source_path)
-        if area_name is None:
-            root_docs.append(artifact)
-            continue
-        groups.setdefault(area_name, []).append(artifact)
-
-    if root_docs and groups:
-        for index, artifact in enumerate(root_docs):
-            target_name = sorted(groups, key=lambda name: len(groups[name]), reverse=True)[
-                index % len(groups)
-            ]
-            groups[target_name].append(artifact)
-    elif root_docs:
-        groups["project-docs"] = root_docs
-
-    areas = []
-    for name, items in sorted(
-        groups.items(), key=lambda p: (_code_count(p[1]), len(p[1])), reverse=True
-    )[:6]:
-        refs = sorted(items, key=lambda item: _source_ref_priority(item.source_path))[:3]
-        paths = [item.source_path for item in refs]
-        areas.append(
-            {
-                "name": name,
-                "summary": (
-                    f"{len(items)}개 파일이 연결된 `{name}` 영역입니다."
-                    f" 대표 파일: {', '.join(paths)}"
-                ),
-                "confidence": min(0.95, 0.45 + len(items) * 0.08),
-                "source_refs": [
-                    {
-                        "path": item.source_path,
-                        "snippet": _normalize(item.raw_text)[:240],
-                        "artifact_id": item.id,
-                    }
-                    for item in refs
-                ],
-            }
-        )
-    return areas or [
-        {
-            "name": "project",
-            "summary": "업로드된 자료 전체를 하나의 프로젝트 영역으로 분석합니다.",
-            "confidence": 0.4,
-            "source_refs": [],
-        }
-    ]
+def _source_ref_priority_for_artifact(artifact: ProjectArtifactRow) -> tuple[int, tuple[int, str], str]:
+    return (0 if artifact.source_type == "code" else 1, _source_ref_priority(artifact.source_path), artifact.source_path)
 
 
 def _area_name_for_path(source_path: str) -> str | None:
@@ -287,10 +234,6 @@ def _area_name_for_path(source_path: str) -> str | None:
         return "/".join(cleaned[:2])
     stem = PurePosixPath(cleaned[0]).stem
     return None if stem.lower() in {"claude", "readme", "pyproject"} else stem
-
-
-def _code_count(items: list[ProjectArtifactRow]) -> int:
-    return sum(1 for item in items if item.source_type == "code")
 
 
 def _source_ref_priority(source_path: str) -> tuple[int, str]:

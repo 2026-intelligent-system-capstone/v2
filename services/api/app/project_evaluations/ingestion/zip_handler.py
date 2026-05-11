@@ -10,6 +10,8 @@ from services.api.app.project_evaluations.domain.models import (
     ArtifactStatus,
 )
 from services.api.app.project_evaluations.ingestion.file_classifier import (
+    CODE_EXTENSIONS,
+    DOCUMENT_EXTENSIONS,
     classify_artifact,
     classify_path,
     is_safe_zip_member,
@@ -120,7 +122,7 @@ def extract_member(
             source_type=source_type,
             status=ArtifactStatus.SKIPPED,
             raw_text="",
-            metadata={**metadata, "reason": "file_too_large"},
+            metadata={**metadata, "reason": "file_too_large", "limit": max_text_bytes},
         )
 
     target_path = safe_target_path(extract_dir, member_name)
@@ -134,17 +136,21 @@ def extract_member(
             source_type=source_type,
             status=ArtifactStatus.SKIPPED,
             raw_text="",
-            metadata={**metadata, "reason": "file_too_large"},
+            metadata={**metadata, "reason": "file_too_large", "limit": max_text_bytes},
         )
     try:
         text = extract_text(target_path, settings)
-    except Exception:
+    except (OSError, UnicodeError, ValueError) as exc:
         return ExtractedArtifact(
             source_path=member_name,
             source_type=source_type,
             status=ArtifactStatus.FAILED,
             raw_text="",
-            metadata={**metadata, "reason": "extract_failed"},
+            metadata={
+                **metadata,
+                "reason": "extract_failed",
+                "extract_error_type": type(exc).__name__,
+            },
         )
 
     if not text.strip():
@@ -185,6 +191,8 @@ def skipped_artifact(
         "artifact_role": classification.artifact_role.value,
         "classification_reason": classification.reason,
     }
+    if reason == "unsupported_extension":
+        metadata["supported_extensions"] = sorted(DOCUMENT_EXTENSIONS | CODE_EXTENSIONS)
     if classification.language:
         metadata["language"] = classification.language
     return ExtractedArtifact(

@@ -133,9 +133,7 @@ def is_safe_zip_member(name: str) -> bool:
 
 def should_ignore_path(path: str) -> bool:
     parts = PurePosixPath(path).parts
-    if any(part in IGNORED_DIRS for part in parts):
-        return True
-    return PurePosixPath(path).suffix.lower() in IGNORED_EXTENSIONS
+    return any(part in IGNORED_DIRS for part in parts)
 
 
 def classify_path(path: str) -> ArtifactSourceType:
@@ -154,6 +152,13 @@ def classify_artifact(path: str) -> ArtifactClassification:
             artifact_role=ArtifactRole.IGNORED,
             language=None,
             reason="ignored_path",
+        )
+    if suffix in IGNORED_EXTENSIONS:
+        return ArtifactClassification(
+            source_type=ArtifactSourceType.IGNORED,
+            artifact_role=ArtifactRole.IGNORED,
+            language=None,
+            reason="unsupported_extension",
         )
     if name in OVERVIEW_NAMES:
         return ArtifactClassification(
