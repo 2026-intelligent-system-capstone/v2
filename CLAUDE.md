@@ -12,18 +12,23 @@
 
 ## 핵심 문서
 
-- `docs/project-evaluation-scope.md`: 제품 범위, MVP 플로우, 도메인 모델, API 초안, 제외 범위
-- `docs/tech-stack.md`: Web 서비스 구현 기술 스택, 아키텍처, 구현 순서
+구현 계획을 세우거나 코드를 작성하기 전 아래 순서로 문서를 확인한다.
 
-구현 계획을 세우거나 코드를 작성하기 전 이 문서들을 먼저 확인한다.
+1. `CLAUDE.md`: 프로젝트 방향, 제외 도메인, 작업 원칙
+2. `docs/project-evaluation-scope.md`: 제품 범위, MVP 플로우, 도메인 모델, API 초안, 제외 범위
+3. `docs/architecture-decisions.md`: 주요 결정 이력, 이전 접근 폐기 사유, 현재 정책 채택 이유
+4. `docs/rag-ingestion-and-retrieval.md`: artifact role 분류, splitter, Qdrant payload, retrieval context pack, source refs 정책
+5. `docs/api-and-job-flow.md`: FastAPI/Streamlit API 흐름, background job 상태 전이, 실패 payload
+6. `docs/security-and-data-policy.md`: zip 처리 안전장치, 파일 제한, 데이터 보관, 실패 처리 정책
+7. `docs/tech-stack.md`: Web 서비스 구현 기술 스택, 아키텍처, 구현 순서
 
 ## MVP 범위
 
 필요한 기능은 오직 프로젝트 수행 진위 검증이다.
 
 - 지원자가 프로젝트 문서와 코드를 단일 zip 파일로 제출한다.
-- 시스템이 zip 내부 문서와 코드를 분석해 프로젝트 context를 만든다.
-- 시스템이 자료 기반 질문을 생성한다.
+- 시스템이 zip 내부 문서와 코드를 role별로 분류하고 분석해 프로젝트 context를 만든다.
+- 시스템이 코드 근거, 문서 근거, document-code alignment를 포함한 RAG context pack으로 자료 기반 질문을 생성한다.
 - Streamlit 기반 단계형 인터뷰를 진행한다.
 - 답변을 Bloom’s Taxonomy와 루브릭으로 평가한다.
 - 프로젝트 각 부분별로 상세 분석 리포트를 생성한다.
@@ -42,7 +47,7 @@ zip 내부에는 다음 자료가 포함될 수 있다.
 - API 명세
 - 프로젝트 설명 텍스트
 
-GitHub URL 직접 분석과 개별 파일 업로드는 v1 범위에서 제외한다.
+GitHub URL 직접 분석과 개별 파일 업로드는 현 MVP 범위에서 제외한다.
 
 ## 유지해야 하는 기존 CLI core 개념
 
@@ -58,6 +63,15 @@ GitHub URL 직접 분석과 개별 파일 업로드는 v1 범위에서 제외한
 - 최종 리포트 생성
 
 단, CLI 입출력, 터미널 UI, 일반 학습 평가 흐름은 그대로 복사하지 않는다. Web 프로젝트 목적에 맞게 core 로직만 재구성한다.
+
+## RAG 기반 질문 생성 원칙
+
+- 질문 생성은 업로드 artifact 앞부분이나 상위 N개 파일 발췌에 의존하지 않는다.
+- zip 내부 코드베이스와 프로젝트 문서는 `artifact_role`로 분류한다.
+- 코드, README/docs, 설정/API 명세, 보고서/PPTX/DOCX는 각 성격에 맞는 splitter와 metadata 정책을 따른다.
+- 질문은 코드 근거와 문서 근거를 함께 사용하고, 문서 주장과 코드 구현의 일치/불일치 지점을 검증해야 한다.
+- 질문과 리포트에는 가능한 범위에서 source refs / evidence refs를 남긴다.
+- RAG/LLM/파일 처리 실패는 조용한 fallback으로 숨기지 않고 job/API/UI 상태에서 원인을 추적 가능하게 드러낸다.
 
 ## 유지해야 하는 평가 방식
 
@@ -116,7 +130,8 @@ FastAPI backend + Streamlit frontend + SQLite3
 ## 작업 원칙
 
 - manyfast MCP를 기획 소스로 사용하지 않는다.
-- 새 요구사항은 `docs/project-evaluation-scope.md`와 이 파일에 반영한다.
+- 새 요구사항은 `docs/project-evaluation-scope.md`, 관련 세부 `docs/`, 이 파일에 반영한다.
 - 일반 교육 플랫폼 기능을 추가하지 않는다.
 - 프로젝트 수행 진위 검증에 직접 필요하지 않은 기능은 제외한다.
 - 구현 전 기존 `cli/CLAUDE.md`와 `cli/` core 파일을 확인한다.
+- 구현 중 문제가 생기면 broad `try/except`나 조용한 fallback으로 우회하지 말고 근본 원인과 실패 상태를 드러낸다.
