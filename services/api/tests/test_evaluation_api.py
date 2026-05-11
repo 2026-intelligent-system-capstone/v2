@@ -29,6 +29,10 @@ from services.api.app.project_evaluations.domain.models import (
 )
 from services.api.app.project_evaluations.rag.chunk_models import ChunkType, RetrievedChunk
 from services.api.app.project_evaluations.rag.embedder import IngestResult
+from services.api.app.project_evaluations.interview.question_generator import (
+    QUESTION_GENERATION_BASE_TOKENS,
+    QUESTION_GENERATION_TOKENS_PER_QUESTION,
+)
 from services.api.app.project_evaluations.service import ProjectEvaluationService
 
 client = TestClient(app)
@@ -47,11 +51,13 @@ class FakeLlm:
         self._enabled = enabled
         self.fail_schema = fail_schema
         self.question_source_paths = question_source_paths or ["main.py", "README.md"]
+        self.calls: list[dict[str, object]] = []
 
     def enabled(self) -> bool:
         return self._enabled
 
     def parse(self, messages, schema, max_tokens):
+        self.calls.append({"schema": schema, "max_tokens": max_tokens})
         if schema is self.fail_schema:
             raise RuntimeError(f"forced {schema.__name__} failure")
         if schema is ProjectContextSchema:
@@ -390,25 +396,79 @@ def test_create_evaluation_question_policy_distributes_by_largest_remainder() ->
 
 
 
-def test_create_evaluation_rejects_question_count_outside_mvp_range() -> None:
+@pytest.mark.parametrize(
+    ("total_question_count", "expected_distribution"),
+    [
+        (
+            1,
+            {
+                "기억": 1,
+                "이해": 0,
+                "적용": 0,
+                "분석": 0,
+                "평가": 0,
+                "창안": 0,
+            },
+        ),
+        (
+            20,
+            {
+                "기억": 4,
+                "이해": 4,
+                "적용": 3,
+                "분석": 3,
+                "평가": 3,
+                "창안": 3,
+            },
+        ),
+    ],
+)
+def test_create_evaluation_accepts_question_count_policy_boundaries(
+    total_question_count: int,
+    expected_distribution: dict[str, int],
+) -> None:
     resp = client.post(
         "/api/project-evaluations",
         json={
-            "project_name": "잘못된 문항 수 프로젝트",
+            "project_name": "경계 문항 수 프로젝트",
             "candidate_name": "정책 지원자",
-            "description": "MVP 문항 수 범위 검증",
-            "room_name": "문항 수 오류 방",
+            "description": "문항 수 정책 경계값 검증",
+            "room_name": "경계 문항 수 방",
             "room_password": "room-pass",
             "admin_password": "admin-pass",
             "question_policy": {
-                "total_question_count": 13,
+                "total_question_count": total_question_count,
                 "bloom_ratios": {level: 1 for level in BLOOM_LEVELS},
             },
         },
     )
 
-    assert resp.status_code == 422
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["question_policy"]["total_question_count"] == total_question_count
+    assert resp.json()["question_policy"]["bloom_distribution"] == expected_distribution
 
+
+@pytest.mark.parametrize("total_question_count", [0, 21])
+def test_create_evaluation_rejects_question_count_outside_policy_range(
+    total_question_count: int,
+) -> None:
+    resp = client.post(
+        "/api/project-evaluations",
+        json={
+            "project_name": "잘못된 문항 수 프로젝트",
+            "candidate_name": "정책 지원자",
+            "description": "정책 문항 수 범위 검증",
+            "room_name": "문항 수 오류 방",
+            "room_password": "room-pass",
+            "admin_password": "admin-pass",
+            "question_policy": {
+                "total_question_count": total_question_count,
+                "bloom_ratios": {level: 1 for level in BLOOM_LEVELS},
+            },
+        },
+    )
+
+    assert resp.status_code == 422, total_question_count
 
 
 def test_create_evaluation_rejects_all_zero_bloom_ratios() -> None:
@@ -433,7 +493,19 @@ def test_create_evaluation_rejects_all_zero_bloom_ratios() -> None:
 
 
 
-def test_create_evaluation_rejects_malformed_bloom_ratios() -> None:
+@pytest.mark.parametrize(
+    "bloom_ratios",
+    [
+        ["기억", "이해"],
+        {"기억": -1, "이해": 1},
+        {"기억": 1.5, "이해": 1},
+        {"기억": True, "이해": 1},
+        {"기억": 11, "이해": 1},
+    ],
+)
+def test_create_evaluation_rejects_malformed_bloom_ratios(
+    bloom_ratios: object,
+) -> None:
     resp = client.post(
         "/api/project-evaluations",
         json={
@@ -445,14 +517,13 @@ def test_create_evaluation_rejects_malformed_bloom_ratios() -> None:
             "admin_password": "admin-pass",
             "question_policy": {
                 "total_question_count": 6,
-                "bloom_ratios": ["기억", "이해"],
+                "bloom_ratios": bloom_ratios,
             },
         },
     )
 
     assert resp.status_code == 422
     assert "Bloom 비율" in str(resp.json()["detail"])
-
 
 
 def test_upload_zip(evaluation_id: str) -> None:
@@ -585,6 +656,70 @@ def test_generate_questions_follows_requested_total_count_and_bloom_distribution
         "기억": 2,
         "적용": 6,
     }
+
+
+def test_generate_questions_supports_twenty_question_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    question_llm = FakeLlm()
+    original_init = ProjectEvaluationService.__init__
+
+    def init_with_observed_question_llm(self, repository, settings):
+        original_init(self, repository, settings)
+        self._analysis_llm = FakeLlm()
+        self._question_llm = question_llm
+        self._eval_llm = FakeLlm()
+        self._report_llm = FakeLlm()
+
+    monkeypatch.setattr(ProjectEvaluationService, "__init__", init_with_observed_question_llm)
+    create_resp = client.post(
+        "/api/project-evaluations",
+        json={
+            "project_name": "20문항 질문 생성 프로젝트",
+            "candidate_name": "생성 지원자",
+            "description": "20문항 질문 생성 검증",
+            "room_name": "20문항 생성 방",
+            "room_password": "room-pass",
+            "admin_password": "admin-pass",
+            "question_policy": {
+                "total_question_count": 20,
+                "bloom_ratios": {level: 1 for level in BLOOM_LEVELS},
+            },
+        },
+    )
+    assert create_resp.status_code == 200, create_resp.text
+    evaluation_id = create_resp.json()["id"]
+
+    upload_resp = client.post(
+        f"/api/project-evaluations/{evaluation_id}/artifacts/zip",
+        files={"file": ("project.zip", _make_zip(), "application/zip")},
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert upload_resp.status_code == 200, upload_resp.text
+    extract_resp = client.post(
+        f"/api/project-evaluations/{evaluation_id}/extract",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert extract_resp.status_code == 200, extract_resp.text
+
+    question_resp = client.post(
+        f"/api/project-evaluations/{evaluation_id}/questions/generate",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+
+    assert question_resp.status_code == 200, question_resp.text
+    questions = question_resp.json()
+    assert len(questions) == 20
+    assert Counter(question["bloom_level"] for question in questions) == {
+        "기억": 4,
+        "이해": 4,
+        "적용": 3,
+        "분석": 3,
+        "평가": 3,
+        "창안": 3,
+    }
+    assert question_llm.calls[-1]["max_tokens"] == 20 * QUESTION_GENERATION_TOKENS_PER_QUESTION
+    assert question_llm.calls[-1]["max_tokens"] > QUESTION_GENERATION_BASE_TOKENS
 
 
 def test_rag_disabled_blocks_context_extraction(

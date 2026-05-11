@@ -73,13 +73,14 @@ BLOOM_ORDER = [
 ]
 DEFAULT_BLOOM_RATIOS = {level.value: 1 for level in BLOOM_ORDER}
 DEFAULT_TOTAL_QUESTION_COUNT = len(BLOOM_ORDER)
+MAX_BLOOM_RATIO = 10
 
 
 class QuestionGenerationPolicy(BaseModel):
     total_question_count: int = Field(
         default=DEFAULT_TOTAL_QUESTION_COUNT,
-        ge=3,
-        le=12,
+        ge=1,
+        le=20,
     )
     bloom_ratios: dict[str, int] = Field(default_factory=lambda: dict(DEFAULT_BLOOM_RATIOS))
     bloom_distribution: dict[str, int] = Field(default_factory=dict)
@@ -121,7 +122,11 @@ def _normalize_bloom_ratios(ratios: Mapping[str, int] | None) -> dict[str, int]:
     normalized = {level.value: 0 for level in BLOOM_ORDER}
     for key, value in source.items():
         level = normalize_bloom_level(key)
-        normalized[level] = max(0, int(value))
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("Bloom 비율은 0부터 10까지의 정수여야 합니다.")
+        if value < 0 or value > MAX_BLOOM_RATIO:
+            raise ValueError("Bloom 비율은 0부터 10까지의 정수여야 합니다.")
+        normalized[level] = value
     return normalized
 
 

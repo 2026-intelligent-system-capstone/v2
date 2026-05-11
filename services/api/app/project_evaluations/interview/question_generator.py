@@ -26,6 +26,8 @@ from services.api.app.project_evaluations.rag.context_pack import build_question
 
 BLOOM_SEQUENCE = BLOOM_ORDER
 BLOOM_MAP = {level.value: level for level in BLOOM_SEQUENCE} | {"창조": BloomLevel.CREATE}
+QUESTION_GENERATION_BASE_TOKENS = 4000
+QUESTION_GENERATION_TOKENS_PER_QUESTION = 650
 
 
 def generate_questions(
@@ -80,7 +82,8 @@ def _generate_with_llm(
         question_policy or QuestionGenerationPolicy(),
         available_source_paths=_available_source_paths(context_pack.source_refs),
     )
-    result: QuestionsSchema = llm.parse(messages, QuestionsSchema, max_tokens=4000)
+    max_tokens = _question_generation_max_tokens(len(sequence))
+    result: QuestionsSchema = llm.parse(messages, QuestionsSchema, max_tokens=max_tokens)
     if len(result.questions) != len(sequence):
         raise RuntimeError(f"LLM이 질문 {len(sequence)}개를 생성하지 못했습니다.")
 
@@ -145,6 +148,13 @@ def _bloom_sequence(policy: QuestionGenerationPolicy) -> list[BloomLevel]:
     if not sequence:
         raise RuntimeError("질문 생성 정책에 배정된 Bloom 문항 수가 없습니다.")
     return sequence
+
+
+def _question_generation_max_tokens(question_count: int) -> int:
+    return max(
+        QUESTION_GENERATION_BASE_TOKENS,
+        question_count * QUESTION_GENERATION_TOKENS_PER_QUESTION,
+    )
 
 
 def _question_source_refs(

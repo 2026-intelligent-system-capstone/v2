@@ -332,6 +332,44 @@ def render_professor() -> None:
     create_tab, manage_tab = st.tabs(["새 방 만들기", "기존 방 관리"])
 
     with create_tab:
+        st.markdown("#### 질문 생성 정책")
+        total_questions = st.slider(
+            "총 문항 수",
+            min_value=1,
+            max_value=20,
+            value=6,
+            step=1,
+            key="create_room_total_questions",
+        )
+        ratio_cols = st.columns(3)
+        bloom_ratios = {}
+        for index, level in enumerate(BLOOM_LEVELS):
+            bloom_ratios[level] = ratio_cols[index % 3].slider(
+                f"{level} 비율",
+                min_value=0,
+                max_value=10,
+                value=1,
+                step=1,
+                key=f"create_room_bloom_ratio_{level}",
+            )
+        planned_counts = calculate_bloom_distribution(int(total_questions), bloom_ratios)
+        if sum(bloom_ratios.values()) == 0:
+            st.warning("Bloom 비율이 모두 0입니다. 하나 이상의 단계 비율을 1 이상으로 설정하세요.")
+        else:
+            st.caption("예정 문항 수는 floor 배분 후 남은 문항을 큰 소수점 순으로 배정합니다. 동률은 Bloom 순서를 따릅니다.")
+            st.dataframe(
+                [
+                    {
+                        "Bloom 단계": level,
+                        "비율": bloom_ratios[level],
+                        "예정 문항 수": planned_counts[level],
+                    }
+                    for level in BLOOM_LEVELS
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+
         with st.form("create_room_form"):
             room_name = st.text_input("방/시험 이름", placeholder="예: 캡스톤 4조 프로젝트 검증")
             project_name = st.text_input("프로젝트명", placeholder="예: 프로젝트 수행 진위 평가 서비스")
@@ -340,35 +378,6 @@ def render_professor() -> None:
             room_password = st.text_input("학생 입장 비밀번호", type="password")
             admin_password = st.text_input("관리자 비밀번호", type="password")
             uploaded_file = st.file_uploader("프로젝트 자료 zip", type=["zip"])
-            st.markdown("#### 질문 생성 정책")
-            total_questions = st.number_input("총 문항 수", min_value=3, max_value=12, value=6, step=1)
-            ratio_cols = st.columns(3)
-            bloom_ratios = {}
-            for index, level in enumerate(BLOOM_LEVELS):
-                bloom_ratios[level] = ratio_cols[index % 3].slider(
-                    f"{level} 비율",
-                    min_value=0,
-                    max_value=10,
-                    value=1,
-                    step=1,
-                )
-            planned_counts = calculate_bloom_distribution(int(total_questions), bloom_ratios)
-            if sum(bloom_ratios.values()) == 0:
-                st.warning("Bloom 비율이 모두 0입니다. 하나 이상의 단계 비율을 1 이상으로 설정하세요.")
-            else:
-                st.caption("예정 문항 수는 floor 배분 후 남은 문항을 큰 소수점 순으로 배정합니다. 동률은 Bloom 순서를 따릅니다.")
-                st.dataframe(
-                    [
-                        {
-                            "Bloom 단계": level,
-                            "비율": bloom_ratios[level],
-                            "예정 문항 수": planned_counts[level],
-                        }
-                        for level in BLOOM_LEVELS
-                    ],
-                    hide_index=True,
-                    use_container_width=True,
-                )
             submitted = st.form_submit_button("방 생성하고 zip 업로드", type="primary")
 
         if submitted:
