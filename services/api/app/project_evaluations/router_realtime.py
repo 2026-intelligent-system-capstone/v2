@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Form, Request, WebSocket
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from services.api.app.project_evaluations.persistence.repository import (
     ProjectEvaluationRepository,
@@ -382,6 +382,39 @@ _HTML = (
 # ---------------------------------------------------------------------------
 
 
+@router.get("/interview/{evaluation_id}/{session_id}/open", response_class=HTMLResponse)
+async def open_interview_page(evaluation_id: str, session_id: str) -> str:
+    return (
+        "<!DOCTYPE html><html lang='ko'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>인터뷰 입장</title></head><body>"
+        "<form method='post'>"
+        "<p>인터뷰 세션을 시작합니다.</p>"
+        "<input type='password' name='session_token' placeholder='세션 토큰' required autofocus>"
+        "<button type='submit'>인터뷰 시작</button>"
+        "</form></body></html>"
+    )
+
+
+@router.post("/interview/{evaluation_id}/{session_id}/open")
+async def set_interview_cookie(
+    request: Request,
+    evaluation_id: str,
+    session_id: str,
+    session_token: str = Form(...),
+) -> RedirectResponse:
+    response = RedirectResponse(f"/interview/{evaluation_id}/{session_id}", status_code=303)
+    response.set_cookie(
+        key=f"interview_session_{session_id}",
+        value=session_token,
+        httponly=True,
+        samesite="strict",
+        max_age=60 * 60 * 2,
+        secure=request.url.scheme == "https",
+    )
+    return response
+
+
 @router.get("/interview/{evaluation_id}/{session_id}", response_class=HTMLResponse)
 async def get_interview_page(evaluation_id: str, session_id: str) -> str:
     return _HTML
@@ -395,12 +428,14 @@ async def interview_websocket(
 ) -> None:
     settings = websocket.app.state.settings
     session_factory = websocket.app.state.session_factory
+    session_token = websocket.cookies.get(f"interview_session_{session_id}", "")
+    client_id = websocket.client.host if websocket.client else "local"
 
     with session_factory() as db_session:
         repo = ProjectEvaluationRepository(db_session)
         service = ProjectEvaluationService(repo, settings)
 
-        service.ensure_session(evaluation_id, session_id)
+        service.ensure_session(evaluation_id, session_id, session_token, client_id)
         questions_read = service.list_questions(evaluation_id)
         questions = [
             {
@@ -417,7 +452,7 @@ async def interview_websocket(
             report = await loop.run_in_executor(
                 None,
                 lambda: service.submit_turns_bulk(
-                    evaluation_id, session_id, answer_texts
+                    evaluation_id, session_id, answer_texts, session_token, client_id
                 ),
             )
             return report.model_dump(mode="json")
