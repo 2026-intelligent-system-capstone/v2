@@ -33,6 +33,10 @@ def get_db_session(request: Request) -> Generator[Session, None, None]:
     yield from get_session(request.app.state.session_factory)
 
 
+def client_id(request: Request) -> str:
+    return request.client.host if request.client else "local"
+
+
 def get_service(
     request: Request,
     session: Annotated[Session, Depends(get_db_session)],
@@ -66,8 +70,9 @@ def verify_admin(
     evaluation_id: str,
     payload: AdminVerifyRequest,
     service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
 ) -> AdminVerifyRead:
-    return service.verify_admin(evaluation_id, payload.admin_password)
+    return service.verify_admin(evaluation_id, payload.admin_password, request_client_id)
 
 
 @router.post("/{evaluation_id}/join", response_model=JoinEvaluationRead)
@@ -75,9 +80,10 @@ def join_evaluation(
     evaluation_id: str,
     payload: JoinEvaluationRequest,
     service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
 ) -> JoinEvaluationRead:
     return service.join_evaluation(
-        evaluation_id, payload.participant_name, payload.room_password
+        evaluation_id, payload.participant_name, payload.room_password, request_client_id
     )
 
 
@@ -161,8 +167,12 @@ def submit_turn(
     session_id: str,
     payload: InterviewTurnCreate,
     service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
+    x_session_token: Annotated[str | None, Header()] = None,
 ) -> InterviewTurnRead:
-    return service.submit_turn(evaluation_id, session_id, payload)
+    return service.submit_turn(
+        evaluation_id, session_id, payload, x_session_token, request_client_id
+    )
 
 
 @router.get(
@@ -173,8 +183,10 @@ def list_turns(
     evaluation_id: str,
     session_id: str,
     service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
+    x_session_token: Annotated[str | None, Header()] = None,
 ) -> list[InterviewTurnRead]:
-    return service.list_turns(evaluation_id, session_id)
+    return service.list_turns(evaluation_id, session_id, x_session_token, request_client_id)
 
 
 @router.post(
@@ -185,8 +197,10 @@ def complete_session(
     evaluation_id: str,
     session_id: str,
     service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
+    x_session_token: Annotated[str | None, Header()] = None,
 ) -> EvaluationReportRead:
-    return service.complete_session(evaluation_id, session_id)
+    return service.complete_session(evaluation_id, session_id, x_session_token, request_client_id)
 
 
 @router.get("/{evaluation_id}/reports/latest", response_model=EvaluationReportRead)

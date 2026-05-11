@@ -42,9 +42,19 @@ def ensure_schema_columns(engine: Engine) -> None:
             "room_name": "VARCHAR(200) NOT NULL DEFAULT ''",
             "room_password_hash": "TEXT NOT NULL DEFAULT ''",
             "admin_password_hash": "TEXT NOT NULL DEFAULT ''",
+            "question_policy_json": "TEXT NOT NULL DEFAULT '{}'",
         },
         "interview_sessions": {
             "participant_name": "VARCHAR(200) NOT NULL DEFAULT ''",
+            "session_token_hash": "TEXT NOT NULL DEFAULT ''",
+        },
+        "extracted_project_contexts": {
+            "rag_status_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+        "interview_questions": {
+            "verification_focus": "TEXT NOT NULL DEFAULT ''",
+            "expected_evidence": "TEXT NOT NULL DEFAULT ''",
+            "source_ref_requirements": "TEXT NOT NULL DEFAULT ''",
         },
     }
     with engine.begin() as connection:

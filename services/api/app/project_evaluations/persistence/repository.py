@@ -6,7 +6,9 @@ from uuid import uuid4
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
+from services.api.app.project_evaluations.rag.redaction import redact_sensitive_text
 from services.api.app.project_evaluations.domain.models import (
+    ArtifactRole,
     ArtifactSourceType,
     ArtifactStatus,
     BloomLevel,
@@ -23,6 +25,7 @@ from services.api.app.project_evaluations.domain.models import (
     ProjectArtifactRead,
     ProjectEvaluationCreate,
     ProjectEvaluationRead,
+    QuestionGenerationPolicy,
     RubricCriterion,
     RubricScoreItem,
     SourceReference,
@@ -62,8 +65,33 @@ def refs_from_json(value: str) -> list[SourceReference]:
     return [SourceReference(**item) for item in from_json(value, [])]
 
 
+def _normalize_legacy_value(value: str) -> str:
+    return "창안" if value == "창조" else value
+
+
 def rubric_from_json(value: str) -> list[RubricCriterion]:
-    return [RubricCriterion(item) for item in from_json(value, [])]
+    return [RubricCriterion(_normalize_legacy_value(item)) for item in from_json(value, [])]
+
+
+def _validate_question_source_refs(question: dict[str, Any]) -> None:
+    refs = question.get("source_refs")
+    if not isinstance(refs, list) or not refs:
+        raise RuntimeError("질문 저장에는 source refs가 필요합니다.")
+    roles = {str(ref.get("artifact_role", "")) for ref in refs if isinstance(ref, dict)}
+    implementation_roles = {
+        ArtifactRole.CODEBASE_SOURCE.value,
+        ArtifactRole.CODEBASE_TEST.value,
+        ArtifactRole.CODEBASE_CONFIG.value,
+        ArtifactRole.CODEBASE_API_SPEC.value,
+    }
+    has_code_ref = bool(roles & implementation_roles)
+    has_document_ref = ArtifactRole.CODEBASE_OVERVIEW.value in roles or any(
+        role.startswith("project_") for role in roles
+    )
+    if not has_code_ref:
+        raise RuntimeError("질문 저장에는 구현 code source ref가 필요합니다.")
+    if not has_document_ref:
+        raise RuntimeError("질문 저장에는 문서/개요 source ref가 필요합니다.")
 
 
 class ProjectEvaluationRepository:
@@ -84,6 +112,7 @@ class ProjectEvaluationRepository:
             room_name=payload.room_name or payload.project_name,
             room_password_hash=room_password_hash,
             admin_password_hash=admin_password_hash,
+            question_policy_json=to_json(payload.question_policy.model_dump()),
             status=EvaluationStatus.CREATED.value,
         )
         self.session.add(row)
@@ -99,6 +128,12 @@ class ProjectEvaluationRepository:
         if row is None:
             return None
         return self.to_evaluation_read(row)
+
+    def get_question_policy(self, evaluation_id: str) -> QuestionGenerationPolicy:
+        row = self.get_evaluation_row(evaluation_id)
+        if row is None:
+            return QuestionGenerationPolicy()
+        return QuestionGenerationPolicy(**from_json(row.question_policy_json, {}))
 
     def update_evaluation_status(
         self, evaluation_id: str, status: EvaluationStatus
@@ -205,7 +240,15 @@ class ProjectEvaluationRepository:
         risk_points: list[str],
         question_targets: list[str],
         areas: list[dict[str, Any]],
+        rag_status: dict[str, Any] | None = None,
     ) -> ExtractedProjectContextRead:
+        if self.has_sessions(evaluation_id):
+            raise RuntimeError("인터뷰가 시작된 평가는 context를 교체할 수 없습니다.")
+        self.session.execute(
+            delete(InterviewQuestionRow).where(
+                InterviewQuestionRow.evaluation_id == evaluation_id
+            )
+        )
         self.session.execute(
             delete(ProjectAreaRow).where(ProjectAreaRow.evaluation_id == evaluation_id)
         )
@@ -224,6 +267,7 @@ class ProjectEvaluationRepository:
         row.data_flow_json = to_json(data_flow)
         row.risk_points_json = to_json(risk_points)
         row.question_targets_json = to_json(question_targets)
+        row.rag_status_json = to_json(rag_status or {})
         if existing is None:
             self.session.add(row)
 
@@ -276,6 +320,8 @@ class ProjectEvaluationRepository:
     def save_questions(
         self, evaluation_id: str, questions: list[dict[str, Any]]
     ) -> list[InterviewQuestionRead]:
+        if self.has_sessions(evaluation_id):
+            raise RuntimeError("인터뷰가 시작된 평가는 질문을 교체할 수 없습니다.")
         self.session.execute(
             delete(InterviewQuestionRow).where(
                 InterviewQuestionRow.evaluation_id == evaluation_id
@@ -283,6 +329,7 @@ class ProjectEvaluationRepository:
         )
         rows = []
         for index, question in enumerate(questions):
+            _validate_question_source_refs(question)
             row = InterviewQuestionRow(
                 id=new_id(),
                 evaluation_id=evaluation_id,
@@ -294,6 +341,9 @@ class ProjectEvaluationRepository:
                 rubric_criteria_json=to_json(question.get("rubric_criteria", [])),
                 source_refs_json=to_json(question.get("source_refs", [])),
                 expected_signal=str(question.get("expected_signal", "")),
+                verification_focus=str(question.get("verification_focus", "")),
+                expected_evidence=str(question.get("expected_evidence", "")),
+                source_ref_requirements=str(question.get("source_ref_requirements", "")),
                 order_index=index,
             )
             self.session.add(row)
@@ -321,18 +371,23 @@ class ProjectEvaluationRepository:
         return self.session.get(InterviewQuestionRow, question_id)
 
     def create_session(
-        self, evaluation_id: str, participant_name: str = ""
+        self,
+        evaluation_id: str,
+        participant_name: str = "",
+        session_token_hash: str = "",
+        session_token: str = "",
     ) -> InterviewSessionRead:
         row = InterviewSessionRow(
             id=new_id(),
             evaluation_id=evaluation_id,
             participant_name=participant_name,
+            session_token_hash=session_token_hash,
             status=InterviewSessionStatus.IN_PROGRESS.value,
         )
         self.session.add(row)
         self.session.commit()
         self.session.refresh(row)
-        return self.to_session_read(row)
+        return self.to_session_read(row, session_token=session_token)
 
     def get_session_row(self, session_id: str) -> InterviewSessionRow | None:
         return self.session.get(InterviewSessionRow, session_id)
@@ -409,12 +464,29 @@ class ProjectEvaluationRepository:
         ).all()
         return [
             RubricScoreItem(
-                criterion=RubricCriterion(row.criterion),
+                criterion=RubricCriterion(_normalize_legacy_value(row.criterion)),
                 score=row.score,
                 rationale=row.rationale,
             )
             for row in rows
         ]
+
+    def rubric_scores_by_turn(self, turn_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+        if not turn_ids:
+            return {}
+        rows = self.session.scalars(
+            select(RubricScoreRow).where(RubricScoreRow.turn_id.in_(turn_ids))
+        ).all()
+        scores: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            scores.setdefault(row.turn_id, []).append(
+                {
+                    "criterion": _normalize_legacy_value(row.criterion),
+                    "score": row.score,
+                    "rationale": row.rationale,
+                }
+            )
+        return scores
 
     def complete_session(self, session_id: str) -> InterviewSessionRead | None:
         row = self.get_session_row(session_id)
@@ -534,6 +606,7 @@ class ProjectEvaluationRepository:
             description=row.description,
             room_name=row.room_name,
             status=EvaluationStatus(row.status),
+            question_policy=QuestionGenerationPolicy(**from_json(row.question_policy_json, {})),
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
@@ -546,7 +619,7 @@ class ProjectEvaluationRepository:
             source_type=ArtifactSourceType(row.source_type),
             status=ArtifactStatus(row.status),
             char_count=row.char_count,
-            text_preview=row.raw_text[:500],
+            text_preview=redact_sensitive_text(row.raw_text)[:500],
             metadata=from_json(row.metadata_json, {}),
             created_at=row.created_at,
         )
@@ -564,6 +637,7 @@ class ProjectEvaluationRepository:
             data_flow=from_json(row.data_flow_json, []),
             risk_points=from_json(row.risk_points_json, []),
             question_targets=from_json(row.question_targets_json, []),
+            rag_status=from_json(row.rag_status_json, {}),
             areas=[self.to_area_read(area) for area in areas],
             created_at=row.created_at,
         )
@@ -585,20 +659,26 @@ class ProjectEvaluationRepository:
             project_area_id=row.project_area_id,
             question=row.question,
             intent=row.intent,
-            bloom_level=BloomLevel(row.bloom_level),
+            bloom_level=BloomLevel(_normalize_legacy_value(row.bloom_level)),
             difficulty=Difficulty(row.difficulty),
             rubric_criteria=rubric_from_json(row.rubric_criteria_json),
             source_refs=refs_from_json(row.source_refs_json),
             expected_signal=row.expected_signal,
+            verification_focus=row.verification_focus,
+            expected_evidence=row.expected_evidence,
+            source_ref_requirements=row.source_ref_requirements,
             order_index=row.order_index,
             created_at=row.created_at,
         )
 
-    def to_session_read(self, row: InterviewSessionRow) -> InterviewSessionRead:
+    def to_session_read(
+        self, row: InterviewSessionRow, session_token: str = ""
+    ) -> InterviewSessionRead:
         return InterviewSessionRead(
             id=row.id,
             evaluation_id=row.evaluation_id,
             participant_name=row.participant_name,
+            session_token=session_token,
             status=InterviewSessionStatus(row.status),
             current_question_index=row.current_question_index,
             created_at=row.created_at,

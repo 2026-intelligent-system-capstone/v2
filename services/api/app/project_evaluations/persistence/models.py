@@ -22,6 +22,7 @@ class ProjectEvaluationRow(Base):
     room_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     room_password_hash: Mapped[str] = mapped_column(Text, nullable=False, default="")
     admin_password_hash: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    question_policy_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="created")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
@@ -67,6 +68,7 @@ class ExtractedProjectContextRow(Base):
     question_targets_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]"
     )
+    rag_status_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )
@@ -104,6 +106,9 @@ class InterviewQuestionRow(Base):
     )
     source_refs_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     expected_signal: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    verification_focus: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    expected_evidence: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source_ref_requirements: Mapped[str] = mapped_column(Text, nullable=False, default="")
     order_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
@@ -118,6 +123,7 @@ class InterviewSessionRow(Base):
         ForeignKey("project_evaluations.id"), index=True, nullable=False
     )
     participant_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    session_token_hash: Mapped[str] = mapped_column(Text, nullable=False, default="")
     status: Mapped[str] = mapped_column(String(40), nullable=False, default="created")
     current_question_index: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0

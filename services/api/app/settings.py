@@ -10,11 +10,12 @@ class ApiSettings(BaseSettings):
     OPENAI_REALTIME_MODEL: str = "gpt-4o-realtime-preview-2024-12-17"
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_COLLECTION_NAME: str = "project_evaluation_chunks"
+    RAG_ENABLED: bool = True
     APP_SQLITE_PATH: str = "data/app.db"
     APP_ARTIFACT_DIR: str = "data/artifacts"
     APP_MAX_UPLOAD_MB: int = 50
     APP_MAX_EXTRACTED_MB: int = 150
-    APP_MAX_TEXT_FILE_MB: int = 2
+    APP_MAX_TEXT_FILE_MB: int = 10
     APP_MAX_ZIP_MEMBERS: int = 500
     APP_MAX_PROCESSED_FILES: int = 120
     APP_MAX_EXTRACTED_TEXT_CHARS: int = 500_000
