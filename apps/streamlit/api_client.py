@@ -6,7 +6,9 @@ from requests import Response
 
 
 class ApiClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, detail: object | None = None) -> None:
+        super().__init__(message)
+        self.detail = detail
 
 
 def get_api_base_url() -> str:
@@ -29,25 +31,42 @@ def request_json(method: str, path: str, timeout: int = 30, **kwargs: object) ->
     except requests.HTTPError as exc:
         response = exc.response
         detail = _error_detail(response) if response is not None else str(exc)
+        detail_text = _format_error_detail(detail, response.status_code if response is not None else None)
         raise ApiClientError(
-            f"FastAPI 서버 요청에 실패했습니다. 요청={method} {url}. {detail}"
+            f"FastAPI 서버 요청에 실패했습니다. 요청={method} {url}. {detail_text}",
+            detail=detail,
         ) from exc
     except requests.RequestException as exc:
         raise ApiClientError(f"FastAPI 서버 요청에 실패했습니다. 요청={method} {url}") from exc
 
 
-def _error_detail(response: Response) -> str:
+def _error_detail(response: Response) -> object:
     try:
         payload = response.json()
     except ValueError:
-        return f"상태={response.status_code}, 응답={response.text[:300]}"
-    if isinstance(payload, dict):
-        detail = payload.get("detail")
-        if isinstance(detail, str):
-            return detail
-        if isinstance(detail, list):
-            return "; ".join(str(item) for item in detail[:3])
-    return f"상태={response.status_code}, 응답={str(payload)[:300]}"
+        return {"status": response.status_code, "message": response.text[:300]}
+    if isinstance(payload, dict) and "detail" in payload:
+        return payload["detail"]
+    return {"status": response.status_code, "message": str(payload)[:300]}
+
+
+def _format_error_detail(detail: object, status_code: int | None = None) -> str:
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, list):
+        return "; ".join(str(item) for item in detail[:3])
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or detail.get("reason") or detail)
+        stage = detail.get("stage")
+        reason = detail.get("reason")
+        prefix_parts = [f"상태={status_code}"] if status_code is not None else []
+        if stage:
+            prefix_parts.append(f"stage={stage}")
+        if reason:
+            prefix_parts.append(f"reason={reason}")
+        prefix = ", ".join(prefix_parts)
+        return f"{prefix}. {message}" if prefix else message
+    return str(detail)
 
 
 def request_json_dict(
@@ -92,18 +111,22 @@ def create_evaluation(
     room_name: str = "",
     room_password: str = "",
     admin_password: str = "",
+    question_policy: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "project_name": project_name,
+        "candidate_name": candidate_name,
+        "description": description,
+        "room_name": room_name,
+        "room_password": room_password,
+        "admin_password": admin_password,
+    }
+    if question_policy is not None:
+        payload = {**payload, "question_policy": question_policy}
     return request_json_dict(
         "POST",
         "/api/project-evaluations",
-        json={
-            "project_name": project_name,
-            "candidate_name": candidate_name,
-            "description": description,
-            "room_name": room_name,
-            "room_password": room_password,
-            "admin_password": admin_password,
-        },
+        json=payload,
     )
 
 
@@ -177,20 +200,28 @@ def create_session(evaluation_id: str, admin_password: str = "") -> dict[str, ob
 
 
 def submit_turn(
-    evaluation_id: str, session_id: str, question_id: str, answer_text: str
+    evaluation_id: str,
+    session_id: str,
+    question_id: str,
+    answer_text: str,
+    session_token: str = "",
 ) -> dict[str, object]:
     return request_json_dict(
         "POST",
         f"/api/project-evaluations/{evaluation_id}/sessions/{session_id}/turns",
         json={"question_id": question_id, "answer_text": answer_text},
+        headers={"X-Session-Token": session_token},
     )
 
 
-def complete_session(evaluation_id: str, session_id: str) -> dict[str, object]:
+def complete_session(
+    evaluation_id: str, session_id: str, session_token: str = ""
+) -> dict[str, object]:
     return request_json_dict(
         "POST",
         f"/api/project-evaluations/{evaluation_id}/sessions/{session_id}/complete",
         timeout=120,
+        headers={"X-Session-Token": session_token},
     )
 
 
