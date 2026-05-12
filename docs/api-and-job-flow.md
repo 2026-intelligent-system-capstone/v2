@@ -136,6 +136,36 @@ FastAPI는 다음의 source of truth다.
 - 리포트 생성
 - job 상태와 실패 원인 저장
 
+## 상태 API
+
+현재 MVP는 별도 job table을 두지 않고 기존 row에서 derived status를 계산한다.
+
+`GET /api/project-evaluations/{evaluation_id}/status`는 관리자 인증 후 다음 필드를 반환한다.
+
+```json
+{
+  "evaluation_id": "eval_123",
+  "status": "questions_generated",
+  "phase": "questions_ready",
+  "has_artifacts": true,
+  "has_context": true,
+  "rag_status": {"status": "indexed", "inserted_count": 128},
+  "question_count": 6,
+  "expected_question_count": 6,
+  "questions_ready": true,
+  "can_generate_questions": false,
+  "can_join": true,
+  "blocked_reason": "",
+  "user_message": "질문이 DB에 저장되어 학생 입장이 가능합니다.",
+  "check_targets": [],
+  "retryable": false
+}
+```
+
+`phase`는 `created`, `uploaded`, `context_ready`, `rag_not_ready`, `indexing_failed`, `question_count_mismatch`, `questions_ready` 중 하나로 계산된다. Streamlit은 질문 생성 응답만 신뢰하지 않고 이 status와 `GET /questions`를 다시 조회해 DB에 저장된 질문을 authoritative source로 표시한다.
+
+추후 background job을 도입하면 `failed_phase`, `last_error_json`, `retryable`을 job table로 옮기고 status endpoint는 job 상태와 현재 row 상태를 함께 조합한다.
+
 ## RAG 상태 표시
 
 분석 결과나 상태 API는 가능한 범위에서 다음 통계를 제공한다.
@@ -157,6 +187,7 @@ FastAPI는 다음의 source of truth다.
 
 - broad `try/except`로 핵심 기능 실패를 성공처럼 처리하지 않는다.
 - RAG index가 비어 있으면 질문 생성을 진행하지 않고 실패 상태를 남긴다.
+- docs-only 또는 overview-only RAG 근거만 있다는 사실은 실패 조건이 아니다. 유효한 source ref path가 있고 수행 진위 검증 질문을 만들 수 있으면 진행한다.
 - 일부 파일 추출 실패는 skipped reason으로 기록하되, 전체 질문 생성이 가능한지 판단 기준을 명확히 둔다.
 - 외부 시스템 오류는 retryable 여부를 기록한다.
 - 사용자가 직접 수정할 수 있는 입력 문제는 확인 대상을 구체적으로 표시한다.

@@ -45,7 +45,7 @@
 - 새 접근: zip 내부 코드베이스와 프로젝트 문서를 `artifact_role`로 분류하고, role별 splitter와 Qdrant retrieval을 통해 구조화된 context pack을 만든다.
 - 결정 이유: 실제 구현 흐름과 문서-코드 일치 여부를 검증하려면 일부 파일 발췌만으로는 근거가 부족하다.
 - 영향을 받는 문서: `CLAUDE.md`, `docs/project-evaluation-scope.md`, `docs/tech-stack.md`, `docs/rag-ingestion-and-retrieval.md`
-- 검증 기준: 질문 생성 결과가 코드 근거, 문서 근거, source refs를 포함하고 artifact 순서나 상위 N개 파일에 의존하지 않는다.
+- 검증 기준: 질문 생성 결과가 사용 가능한 source refs를 포함하고 artifact 순서나 상위 N개 파일에 의존하지 않는다. 코드 근거와 문서 근거의 동시 사용은 선호 조건이며, docs-only 또는 overview-only RAG 근거만 있다는 이유만으로 실패하지 않는다.
 
 ## 2026-05-10. 코드와 프로젝트 문서의 alignment를 핵심 검증 근거로 채택
 
