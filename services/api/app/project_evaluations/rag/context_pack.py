@@ -48,8 +48,6 @@ def build_question_context_pack(
         chunks.extend(retriever(query, artifact_roles=DOCUMENT_ROLES, top_k=3))
 
     selected = _diverse_chunks(chunks, max_chunks=max_chunks)
-    if selected and not any((chunk.artifact_role or "") in CODE_ROLES for chunk in selected):
-        raise RuntimeError("질문 생성에 필요한 코드베이스 근거가 없습니다. docs-only RAG 근거로는 질문을 만들 수 없습니다.")
     return ContextPack(
         snippets=_format_snippets(selected),
         source_refs=_source_refs(selected),

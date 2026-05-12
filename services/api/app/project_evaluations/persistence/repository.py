@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 
 from services.api.app.project_evaluations.rag.redaction import redact_sensitive_text
 from services.api.app.project_evaluations.domain.models import (
-    ArtifactRole,
     ArtifactSourceType,
     ArtifactStatus,
     BloomLevel,
@@ -77,21 +76,9 @@ def _validate_question_source_refs(question: dict[str, Any]) -> None:
     refs = question.get("source_refs")
     if not isinstance(refs, list) or not refs:
         raise RuntimeError("질문 저장에는 source refs가 필요합니다.")
-    roles = {str(ref.get("artifact_role", "")) for ref in refs if isinstance(ref, dict)}
-    implementation_roles = {
-        ArtifactRole.CODEBASE_SOURCE.value,
-        ArtifactRole.CODEBASE_TEST.value,
-        ArtifactRole.CODEBASE_CONFIG.value,
-        ArtifactRole.CODEBASE_API_SPEC.value,
-    }
-    has_code_ref = bool(roles & implementation_roles)
-    has_document_ref = ArtifactRole.CODEBASE_OVERVIEW.value in roles or any(
-        role.startswith("project_") for role in roles
-    )
-    if not has_code_ref:
-        raise RuntimeError("질문 저장에는 구현 code source ref가 필요합니다.")
-    if not has_document_ref:
-        raise RuntimeError("질문 저장에는 문서/개요 source ref가 필요합니다.")
+    valid_refs = [ref for ref in refs if isinstance(ref, dict) and str(ref.get("path", "")).strip()]
+    if not valid_refs:
+        raise RuntimeError("질문 저장에는 유효한 source ref가 필요합니다.")
 
 
 class ProjectEvaluationRepository:
@@ -322,6 +309,8 @@ class ProjectEvaluationRepository:
     ) -> list[InterviewQuestionRead]:
         if self.has_sessions(evaluation_id):
             raise RuntimeError("인터뷰가 시작된 평가는 질문을 교체할 수 없습니다.")
+        for question in questions:
+            _validate_question_source_refs(question)
         self.session.execute(
             delete(InterviewQuestionRow).where(
                 InterviewQuestionRow.evaluation_id == evaluation_id
@@ -329,7 +318,6 @@ class ProjectEvaluationRepository:
         )
         rows = []
         for index, question in enumerate(questions):
-            _validate_question_source_refs(question)
             row = InterviewQuestionRow(
                 id=new_id(),
                 evaluation_id=evaluation_id,

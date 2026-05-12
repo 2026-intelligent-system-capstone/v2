@@ -26,8 +26,8 @@ from services.api.app.project_evaluations.rag.context_pack import build_question
 
 BLOOM_SEQUENCE = BLOOM_ORDER
 BLOOM_MAP = {level.value: level for level in BLOOM_SEQUENCE} | {"창조": BloomLevel.CREATE}
-QUESTION_GENERATION_BASE_TOKENS = 4000
-QUESTION_GENERATION_TOKENS_PER_QUESTION = 650
+QUESTION_GENERATION_BASE_TOKENS = 10000
+QUESTION_GENERATION_TOKENS_PER_QUESTION = 10000
 
 
 def generate_questions(
@@ -81,6 +81,7 @@ def _generate_with_llm(
         context_pack.snippets,
         question_policy or QuestionGenerationPolicy(),
         available_source_paths=_available_source_paths(context_pack.source_refs),
+        available_source_refs=context_pack.source_refs,
     )
     max_tokens = _question_generation_max_tokens(len(sequence))
     result: QuestionsSchema = llm.parse(messages, QuestionsSchema, max_tokens=max_tokens)
@@ -181,18 +182,13 @@ def _validate_llm_source_refs(
     if not preferred_paths:
         raise RuntimeError(f"LLM 질문 결과에 source_refs가 없습니다: {question}")
     available_by_path = {
-        _normalize_path(str(ref.get("path", ""))): ref
+        _clean_source_path(str(ref.get("path", ""))): ref
         for ref in available_refs
-        if _normalize_path(str(ref.get("path", "")))
+        if _clean_source_path(str(ref.get("path", "")))
     }
-    unknown_paths = [path for path in preferred_paths if _normalize_path(path) not in available_by_path]
+    unknown_paths = [path for path in preferred_paths if _clean_source_path(path) not in available_by_path]
     if unknown_paths:
         raise RuntimeError(f"LLM이 제공되지 않은 source ref 경로를 반환했습니다: {unknown_paths}")
-    preferred_refs = [available_by_path[_normalize_path(path)] for path in preferred_paths]
-    if not _has_code_ref(preferred_refs):
-        raise RuntimeError(f"LLM 질문 결과가 구현 code source ref를 포함하지 않았습니다: {question}")
-    if not _has_document_ref(preferred_refs):
-        raise RuntimeError(f"LLM 질문 결과가 문서/개요 source ref를 포함하지 않았습니다: {question}")
 
 
 def _refs_by_preferred_paths(
@@ -236,34 +232,7 @@ def _ensure_question_source_refs(question: str, source_refs: list[dict[str, obje
     selected = _unique_refs(source_refs)
     if not selected:
         raise RuntimeError(f"질문에 연결할 source refs가 없습니다: {question}")
-    if not _has_code_ref(selected):
-        raise RuntimeError(f"질문에 구현 code source ref가 없습니다: {question}")
-    if not _has_document_ref(selected):
-        raise RuntimeError(f"질문에 문서/개요 source ref가 없습니다: {question}")
     return selected
-
-
-def _has_code_ref(source_refs: list[dict[str, object]]) -> bool:
-    return any(_is_code_ref(ref) for ref in source_refs)
-
-
-def _has_document_ref(source_refs: list[dict[str, object]]) -> bool:
-    return any(_is_document_ref(ref) for ref in source_refs)
-
-
-def _is_code_ref(ref: dict[str, object]) -> bool:
-    implementation_roles = {
-        "codebase_source",
-        "codebase_test",
-        "codebase_config",
-        "codebase_api_spec",
-    }
-    return str(ref.get("artifact_role", "")) in implementation_roles
-
-
-def _is_document_ref(ref: dict[str, object]) -> bool:
-    role = str(ref.get("artifact_role", ""))
-    return role == "codebase_overview" or role.startswith("project_")
 
 
 def _unique_refs(source_refs: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -290,13 +259,18 @@ def _available_source_paths(source_refs: list[dict[str, object]]) -> list[str]:
 
 
 def _normalize_path(path: str) -> str:
+    normalized = _clean_source_path(path)
+    normalized = normalized.split(":L", 1)[0]
+    normalized = normalized.split(":page", 1)[0]
+    normalized = normalized.split(":slide", 1)[0]
+    return normalized.strip().strip("[]` ")
+
+
+def _clean_source_path(path: str) -> str:
     normalized = path.strip().strip("` ")
     if normalized.startswith("[") and "]" in normalized:
         normalized = normalized[1 : normalized.index("]")]
     normalized = normalized.split(" | ")[-1]
-    normalized = normalized.split(":L", 1)[0]
-    normalized = normalized.split(":page", 1)[0]
-    normalized = normalized.split(":slide", 1)[0]
     return normalized.strip().strip("[]` ")
 
 

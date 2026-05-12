@@ -20,11 +20,13 @@ from services.api.app.project_evaluations.analysis.prompts import (
     QuestionsSchema,
     ReportSchema,
     RubricScoreSchema,
+    build_questions_prompt,
 )
 from services.api.app.project_evaluations.domain.models import (
     ArtifactRole,
     ArtifactSourceType,
     FinalDecision,
+    QuestionGenerationPolicy,
     RubricCriterion,
 )
 from services.api.app.project_evaluations.rag.chunk_models import ChunkType, RetrievedChunk
@@ -47,10 +49,12 @@ class FakeLlm:
         enabled: bool = True,
         fail_schema: type | None = None,
         question_source_paths: list[str] | None = None,
+        empty_questions: bool = False,
     ) -> None:
         self._enabled = enabled
         self.fail_schema = fail_schema
-        self.question_source_paths = question_source_paths or ["main.py", "README.md"]
+        self.question_source_paths = ["main.py", "README.md"] if question_source_paths is None else question_source_paths
+        self.empty_questions = empty_questions
         self.calls: list[dict[str, object]] = []
 
     def enabled(self) -> bool:
@@ -72,6 +76,8 @@ class FakeLlm:
                 areas=[AreaSchema(name="API 흐름", summary="업로드와 질문 생성 흐름", confidence=0.9)],
             )
         if schema is QuestionsSchema:
+            if self.empty_questions:
+                return QuestionsSchema(questions=[])
             distribution = _question_distribution_from_messages(messages)
             questions = []
             for level, count in distribution.items():
@@ -129,6 +135,9 @@ class FakeLlm:
 
 def _question_distribution_from_messages(messages) -> dict[str, int]:
     content = "\n".join(str(message.get("content", "")) for message in messages)
+    slot_counts = Counter(re.findall(r"bloom_level=(기억|이해|적용|분석|평가|창안)", content))
+    if slot_counts:
+        return dict(slot_counts)
     distribution = {}
     for level in BLOOM_LEVELS:
         match = re.search(rf"- {level}: (\d+)개", content)
@@ -563,6 +572,74 @@ def test_upload_non_zip_rejected(evaluation_id: str) -> None:
     assert resp.status_code == 400
 
 
+def test_status_created_phase_requires_artifacts(evaluation_id: str) -> None:
+    resp = client.get(
+        f"/api/project-evaluations/{evaluation_id}/status",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["phase"] == "created"
+    assert data["has_artifacts"] is False
+    assert data["has_context"] is False
+    assert data["question_count"] == 0
+    assert data["expected_question_count"] == 6
+    assert data["can_generate_questions"] is False
+    assert data["can_join"] is False
+    assert data["blocked_reason"] == "artifacts_required"
+    assert "zip 업로드" in data["check_targets"]
+
+
+def test_status_tracks_upload_context_and_questions(evaluation_with_upload: str) -> None:
+    uploaded_resp = client.get(
+        f"/api/project-evaluations/{evaluation_with_upload}/status",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert uploaded_resp.status_code == 200, uploaded_resp.text
+    uploaded = uploaded_resp.json()
+    assert uploaded["phase"] == "uploaded"
+    assert uploaded["has_artifacts"] is True
+    assert uploaded["has_context"] is False
+    assert uploaded["can_generate_questions"] is False
+    assert uploaded["can_join"] is False
+
+    extract_resp = client.post(
+        f"/api/project-evaluations/{evaluation_with_upload}/extract",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert extract_resp.status_code == 200, extract_resp.text
+    context_ready_resp = client.get(
+        f"/api/project-evaluations/{evaluation_with_upload}/status",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert context_ready_resp.status_code == 200, context_ready_resp.text
+    context_ready = context_ready_resp.json()
+    assert context_ready["phase"] == "context_ready"
+    assert context_ready["has_context"] is True
+    assert context_ready["rag_status"]["status"] == "indexed"
+    assert context_ready["can_generate_questions"] is True
+    assert context_ready["can_join"] is False
+
+    question_resp = client.post(
+        f"/api/project-evaluations/{evaluation_with_upload}/questions/generate",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert question_resp.status_code == 200, question_resp.text
+    ready_resp = client.get(
+        f"/api/project-evaluations/{evaluation_with_upload}/status",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert ready_resp.status_code == 200, ready_resp.text
+    ready = ready_resp.json()
+    assert ready["phase"] == "questions_ready"
+    assert ready["question_count"] == 6
+    assert ready["expected_question_count"] == 6
+    assert ready["questions_ready"] is True
+    assert ready["can_generate_questions"] is False
+    assert ready["can_join"] is True
+
+
 def test_extract_context(evaluation_with_upload: str) -> None:
     resp = client.post(
         f"/api/project-evaluations/{evaluation_with_upload}/extract",
@@ -576,6 +653,58 @@ def test_extract_context(evaluation_with_upload: str) -> None:
     assert data["rag_status"]["enabled"] is True
     assert data["rag_status"]["status"] == "indexed"
     assert data["rag_status"]["inserted_count"] == 4
+
+
+def test_build_questions_prompt_contains_strict_generation_contract() -> None:
+    messages = build_questions_prompt(
+        project_summary="FastAPI와 SQLite 기반 프로젝트 평가 서비스입니다.",
+        areas=[{"name": "API 흐름", "summary": "업로드와 질문 생성 흐름"}],
+        artifact_snippets=[
+            "[codebase_source | code_symbol | main.py]\nFastAPI 앱은 main.py에서 생성됩니다.",
+            "[codebase_overview | codebase_overview | README.md]\nREADME는 프로젝트 목적을 설명합니다.",
+        ],
+        question_policy=QuestionGenerationPolicy(
+            total_question_count=8,
+            bloom_ratios={
+                "기억": 1,
+                "이해": 0,
+                "적용": 3,
+                "분석": 0,
+                "평가": 0,
+                "창안": 0,
+            },
+        ),
+        available_source_paths=["main.py", "README.md"],
+        available_source_refs=[
+            {
+                "path": "main.py",
+                "artifact_role": ArtifactRole.CODEBASE_SOURCE.value,
+                "chunk_type": ChunkType.CODE_SYMBOL.value,
+            },
+            {
+                "path": "README.md",
+                "artifact_role": ArtifactRole.CODEBASE_OVERVIEW.value,
+                "chunk_type": ChunkType.CODEBASE_OVERVIEW.value,
+            },
+        ],
+    )
+    content = "\n".join(str(message["content"]) for message in messages)
+
+    assert "총 문항 수: 8개" in content
+    assert "- 기억: 2개" in content
+    assert "- 적용: 6개" in content
+    assert "1. bloom_level=기억" in content
+    assert "2. bloom_level=기억" in content
+    assert "3. bloom_level=적용" in content
+    assert "8. bloom_level=적용" in content
+    assert "source_refs.path는 반드시 사용 가능한 source ref 목록" in content
+    assert "각 질문의 source_refs에는 사용 가능한 source ref path 중 1개 이상" in content
+    assert "코드 근거와 문서/개요 근거를 함께 사용할 수 있으면" in content
+    assert "code-only, docs-only, overview-only RAG 근거만 사용 가능한 경우에도" in content
+    assert "JSON 객체만 출력" in content
+    assert "Markdown 코드블록은 출력하지 마세요" in content
+    assert "path=main.py; artifact_role=codebase_source; chunk_type=code_symbol" in content
+    assert "path=README.md; artifact_role=codebase_overview; chunk_type=codebase_overview" in content
 
 
 def test_generate_questions(evaluation_with_context: str) -> None:
@@ -786,6 +915,45 @@ def test_list_questions(evaluation_with_questions: str) -> None:
     assert len(resp.json()) >= 1
 
 
+def test_status_blocks_partial_question_set(
+    evaluation_with_context: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from services.api.app.project_evaluations.persistence.repository import (
+        ProjectEvaluationRepository,
+    )
+
+    original_save_questions = ProjectEvaluationRepository.save_questions
+
+    def save_partial_questions(self, evaluation_id: str, questions: list[dict[str, object]]):
+        return original_save_questions(self, evaluation_id, questions[:1])
+
+    monkeypatch.setattr(ProjectEvaluationRepository, "save_questions", save_partial_questions)
+
+    resp = client.post(
+        f"/api/project-evaluations/{evaluation_with_context}/questions/generate",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert resp.status_code == 500, resp.text
+
+    status_resp = client.get(
+        f"/api/project-evaluations/{evaluation_with_context}/status",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+    assert status_resp.status_code == 200, status_resp.text
+    data = status_resp.json()
+    assert data["phase"] == "question_count_mismatch"
+    assert data["question_count"] == 1
+    assert data["expected_question_count"] == 6
+    assert data["can_join"] is False
+
+    join_resp = client.post(
+        f"/api/project-evaluations/{evaluation_with_context}/join",
+        json={"participant_name": "테스트 지원자", "room_password": "room-pass"},
+    )
+    assert join_resp.status_code == 409
+    assert join_resp.json()["detail"]["reason"] == "questions_not_ready"
+
+
 def test_generate_questions_after_session_start_is_rejected(evaluation_with_questions: str) -> None:
     evaluation_id = evaluation_with_questions
     resp = client.post(
@@ -830,7 +998,34 @@ def test_generate_questions_rejects_unknown_llm_source_ref(
 
 
 
-def test_generate_questions_rejects_code_only_llm_source_ref(
+def test_generate_questions_rejects_llm_source_ref_with_line_suffix(
+    evaluation_with_context: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def init_with_suffixed_ref(self, repository, settings):
+        self.repository = repository
+        self.settings = settings
+        self._analysis_llm = FakeLlm()
+        self._question_llm = FakeLlm(question_source_paths=["main.py:L1"])
+        self._eval_llm = FakeLlm()
+        self._report_llm = FakeLlm()
+        self._openai = None
+        self._qdrant = None
+
+    monkeypatch.setattr(ProjectEvaluationService, "__init__", init_with_suffixed_ref)
+
+    resp = client.post(
+        f"/api/project-evaluations/{evaluation_with_context}/questions/generate",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert detail["stage"] == "question_generation"
+    assert "제공되지 않은 source ref" in detail["message"]
+
+
+
+def test_generate_questions_accepts_code_only_llm_source_ref(
     evaluation_with_context: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def init_with_code_only_ref(self, repository, settings):
@@ -850,14 +1045,18 @@ def test_generate_questions_rejects_code_only_llm_source_ref(
         headers={"X-Admin-Password": "admin-pass"},
     )
 
-    assert resp.status_code == 502
-    detail = resp.json()["detail"]
-    assert detail["stage"] == "question_generation"
-    assert "문서/개요 source ref" in detail["message"]
+    assert resp.status_code == 200, resp.text
+    questions = resp.json()
+    assert len(questions) == 6
+    assert all(question["source_refs"] for question in questions)
+    assert all(
+        "main.py" in {ref["path"] for ref in question["source_refs"]}
+        for question in questions
+    )
 
 
 
-def test_generate_questions_rejects_docs_only_llm_source_ref(
+def test_generate_questions_accepts_docs_only_llm_source_ref(
     evaluation_with_context: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def init_with_docs_only_ref(self, repository, settings):
@@ -877,10 +1076,14 @@ def test_generate_questions_rejects_docs_only_llm_source_ref(
         headers={"X-Admin-Password": "admin-pass"},
     )
 
-    assert resp.status_code == 502
-    detail = resp.json()["detail"]
-    assert detail["stage"] == "question_generation"
-    assert "구현 code source ref" in detail["message"]
+    assert resp.status_code == 200, resp.text
+    questions = resp.json()
+    assert len(questions) == 6
+    assert all(question["source_refs"] for question in questions)
+    assert all(
+        "README.md" in {ref["path"] for ref in question["source_refs"]}
+        for question in questions
+    )
 
 
 
@@ -908,6 +1111,56 @@ def test_generate_questions_llm_failure_is_exposed(
     detail = resp.json()["detail"]
     assert detail["stage"] == "question_generation"
     assert "forced QuestionsSchema failure" in detail["message"]
+
+
+def test_generate_questions_rejects_empty_llm_source_refs(
+    evaluation_with_context: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def init_with_empty_refs(self, repository, settings):
+        self.repository = repository
+        self.settings = settings
+        self._analysis_llm = FakeLlm()
+        self._question_llm = FakeLlm(question_source_paths=[])
+        self._eval_llm = FakeLlm()
+        self._report_llm = FakeLlm()
+        self._openai = None
+        self._qdrant = None
+
+    monkeypatch.setattr(ProjectEvaluationService, "__init__", init_with_empty_refs)
+
+    resp = client.post(
+        f"/api/project-evaluations/{evaluation_with_context}/questions/generate",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert detail["stage"] == "question_generation"
+    assert "source_refs" in detail["message"]
+
+
+
+def test_generate_questions_empty_result_is_exposed(
+    evaluation_with_context: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def empty_question_result(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(
+        "services.api.app.project_evaluations.service.generate_questions",
+        empty_question_result,
+    )
+
+    resp = client.post(
+        f"/api/project-evaluations/{evaluation_with_context}/questions/generate",
+        headers={"X-Admin-Password": "admin-pass"},
+    )
+
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert detail["stage"] == "question_generation"
+    assert detail["reason"] == "no_questions_generated"
+    assert "RAG 검색 결과" in detail["check_targets"]
 
 
 def test_submit_turn_llm_failure_is_exposed(

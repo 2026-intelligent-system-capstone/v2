@@ -187,7 +187,7 @@ def test_context_pack_prioritizes_code_chunks_before_document_chunks() -> None:
 
 
 
-def test_context_pack_rejects_overview_only_question_evidence() -> None:
+def test_context_pack_accepts_overview_only_question_evidence() -> None:
     overview_chunk = RetrievedChunk(
         text="README에는 zip 업로드와 RAG 기반 질문 생성 흐름이 설명되어 있습니다.",
         source_path="README.md",
@@ -198,21 +198,20 @@ def test_context_pack_rejects_overview_only_question_evidence() -> None:
         score=0.99,
     )
 
-    try:
-        build_question_context_pack(
-            retriever=lambda *_args, **_kwargs: [overview_chunk],
-            project_summary="zip 업로드와 질문 생성 흐름",
-            areas=[{"name": "ingestion", "summary": "zip 처리와 RAG context pack"}],
-            max_chunks=2,
-        )
-    except RuntimeError as exc:
-        assert "코드베이스 근거" in str(exc)
-    else:
-        raise AssertionError("overview-only RAG 근거는 구현 코드 근거로 허용되면 안 됩니다.")
+    pack = build_question_context_pack(
+        retriever=lambda *_args, **_kwargs: [overview_chunk],
+        project_summary="zip 업로드와 질문 생성 흐름",
+        areas=[{"name": "ingestion", "summary": "zip 처리와 RAG context pack"}],
+        max_chunks=2,
+    )
+
+    assert len(pack.chunks) == 1
+    assert pack.source_refs[0]["path"] == "README.md"
+    assert pack.source_refs[0]["artifact_role"] == ArtifactRole.CODEBASE_OVERVIEW.value
 
 
 
-def test_context_pack_rejects_docs_only_question_evidence() -> None:
+def test_context_pack_accepts_docs_only_question_evidence() -> None:
     document_chunk = RetrievedChunk(
         text="보고서에는 zip 업로드와 RAG 기반 질문 생성 흐름이 설명되어 있습니다.",
         source_path="docs/final-report.pdf",
@@ -224,17 +223,16 @@ def test_context_pack_rejects_docs_only_question_evidence() -> None:
         page_number=3,
     )
 
-    try:
-        build_question_context_pack(
-            retriever=lambda *_args, **_kwargs: [document_chunk],
-            project_summary="zip 업로드와 질문 생성 흐름",
-            areas=[{"name": "ingestion", "summary": "zip 처리와 RAG context pack"}],
-            max_chunks=2,
-        )
-    except RuntimeError as exc:
-        assert "코드베이스 근거" in str(exc)
-    else:
-        raise AssertionError("docs-only RAG 근거는 질문 context pack으로 허용되면 안 됩니다.")
+    pack = build_question_context_pack(
+        retriever=lambda *_args, **_kwargs: [document_chunk],
+        project_summary="zip 업로드와 질문 생성 흐름",
+        areas=[{"name": "ingestion", "summary": "zip 처리와 RAG context pack"}],
+        max_chunks=2,
+    )
+
+    assert len(pack.chunks) == 1
+    assert pack.source_refs[0]["path"] == "docs/final-report.pdf"
+    assert pack.source_refs[0]["artifact_role"] == ArtifactRole.PROJECT_REPORT.value
 
 
 

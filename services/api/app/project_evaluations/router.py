@@ -20,6 +20,7 @@ from services.api.app.project_evaluations.domain.models import (
     ProjectArtifactRead,
     ProjectEvaluationCreate,
     ProjectEvaluationRead,
+    ProjectEvaluationStatusRead,
 )
 from services.api.app.project_evaluations.persistence.repository import (
     ProjectEvaluationRepository,
@@ -63,6 +64,16 @@ def get_evaluation(
 ) -> ProjectEvaluationRead:
     service.ensure_admin(evaluation_id, x_admin_password)
     return service.get_evaluation(evaluation_id)
+
+
+@router.get("/{evaluation_id}/status", response_model=ProjectEvaluationStatusRead)
+def get_evaluation_status(
+    evaluation_id: str,
+    service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    x_admin_password: Annotated[str | None, Header()] = None,
+) -> ProjectEvaluationStatusRead:
+    service.ensure_admin(evaluation_id, x_admin_password)
+    return service.get_status(evaluation_id)
 
 
 @router.post("/{evaluation_id}/admin/verify", response_model=AdminVerifyRead)

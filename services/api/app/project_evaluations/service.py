@@ -30,6 +30,7 @@ from services.api.app.project_evaluations.domain.models import (
     ProjectArtifactRead,
     ProjectEvaluationCreate,
     ProjectEvaluationRead,
+    ProjectEvaluationStatusRead,
 )
 from services.api.app.project_evaluations.ingestion.file_classifier import (
     CODE_EXTENSIONS,
@@ -186,6 +187,155 @@ class ProjectEvaluationService:
                 detail="프로젝트 평가를 찾을 수 없습니다.",
             )
         return evaluation
+
+    def get_status(self, evaluation_id: str) -> ProjectEvaluationStatusRead:
+        evaluation = self.get_evaluation(evaluation_id)
+        has_artifacts = self.repository.has_artifacts(evaluation_id)
+        context_row = self.repository.get_context_row(evaluation_id)
+        question_rows = self.repository.list_question_rows(evaluation_id)
+        question_policy = self.repository.get_question_policy(evaluation_id)
+        has_context = context_row is not None
+        rag_status = from_json(context_row.rag_status_json, {}) if context_row else {}
+        if has_context and not rag_status and not self.settings.RAG_ENABLED:
+            rag_status = {"enabled": False, "reason": "rag_disabled"}
+        return self._status_from_rows(
+            evaluation_id=evaluation.id,
+            status_value=evaluation.status.value,
+            has_artifacts=has_artifacts,
+            has_context=has_context,
+            rag_status=rag_status,
+            question_count=len(question_rows),
+            expected_question_count=question_policy.total_question_count,
+            has_sessions=self.repository.has_sessions(evaluation_id),
+        )
+
+    def _status_from_rows(
+        self,
+        evaluation_id: str,
+        status_value: str,
+        has_artifacts: bool,
+        has_context: bool,
+        rag_status: dict[str, object],
+        question_count: int,
+        expected_question_count: int,
+        has_sessions: bool,
+    ) -> ProjectEvaluationStatusRead:
+        questions_ready = question_count == expected_question_count and question_count > 0
+        partial_questions = 0 < question_count < expected_question_count
+        question_count_mismatch = question_count > expected_question_count > 0
+        rag_ready = rag_status.get("status") == "indexed"
+        if not has_artifacts:
+            return ProjectEvaluationStatusRead(
+                evaluation_id=evaluation_id,
+                status=status_value,
+                phase="created",
+                has_artifacts=False,
+                has_context=False,
+                rag_status=rag_status,
+                question_count=question_count,
+                expected_question_count=expected_question_count,
+                questions_ready=False,
+                can_generate_questions=False,
+                can_join=False,
+                blocked_reason="artifacts_required",
+                user_message="프로젝트 zip 자료를 업로드해야 분석과 질문 생성을 시작할 수 있습니다.",
+                check_targets=["zip 업로드", "지원 확장자", "파일 처리 제한"],
+            )
+        if not has_context:
+            return ProjectEvaluationStatusRead(
+                evaluation_id=evaluation_id,
+                status=status_value,
+                phase="uploaded",
+                has_artifacts=True,
+                has_context=False,
+                rag_status=rag_status,
+                question_count=question_count,
+                expected_question_count=expected_question_count,
+                questions_ready=False,
+                can_generate_questions=False,
+                can_join=False,
+                blocked_reason="context_required",
+                user_message="자료 업로드는 완료됐지만 프로젝트 분석 context가 아직 생성되지 않았습니다.",
+                check_targets=["자료 분석 실행", "RAG 인덱싱 설정", "추출 가능한 텍스트"],
+                retryable=True,
+            )
+        if questions_ready:
+            return ProjectEvaluationStatusRead(
+                evaluation_id=evaluation_id,
+                status=status_value,
+                phase="questions_ready",
+                has_artifacts=True,
+                has_context=True,
+                rag_status=rag_status,
+                question_count=question_count,
+                expected_question_count=expected_question_count,
+                questions_ready=True,
+                can_generate_questions=False,
+                can_join=True,
+                user_message="질문이 DB에 저장되어 학생 입장이 가능합니다.",
+            )
+        if partial_questions or question_count_mismatch:
+            return ProjectEvaluationStatusRead(
+                evaluation_id=evaluation_id,
+                status=status_value,
+                phase="question_count_mismatch",
+                has_artifacts=True,
+                has_context=True,
+                rag_status=rag_status,
+                question_count=question_count,
+                expected_question_count=expected_question_count,
+                questions_ready=False,
+                can_generate_questions=not has_sessions,
+                can_join=False,
+                blocked_reason="question_count_mismatch",
+                user_message="저장된 질문 수가 질문 정책과 일치하지 않습니다. 질문을 다시 생성해야 합니다.",
+                check_targets=["저장된 질문 수", "question_policy", "질문 생성/저장 로그"],
+                retryable=not has_sessions,
+            )
+        if bool(rag_status.get("enabled", self.settings.RAG_ENABLED)) and not rag_ready:
+            rag_failed = rag_status.get("status") == "failed"
+            return ProjectEvaluationStatusRead(
+                evaluation_id=evaluation_id,
+                status=status_value,
+                phase="indexing_failed" if rag_failed else "rag_not_ready",
+                has_artifacts=True,
+                has_context=True,
+                rag_status=rag_status,
+                question_count=question_count,
+                expected_question_count=expected_question_count,
+                questions_ready=False,
+                can_generate_questions=False,
+                can_join=False,
+                blocked_reason="rag_ingestion_failed" if rag_failed else "rag_not_ready",
+                user_message=str(
+                    rag_status.get("message")
+                    or rag_status.get("reason")
+                    or "질문 생성을 위한 RAG 인덱스가 준비되지 않았습니다."
+                ),
+                check_targets=["Qdrant 실행 상태", "embedding 설정", "RAG chunk 저장 결과"],
+                retryable=True,
+            )
+        return ProjectEvaluationStatusRead(
+            evaluation_id=evaluation_id,
+            status=status_value,
+            phase="context_ready",
+            has_artifacts=True,
+            has_context=True,
+            rag_status=rag_status,
+            question_count=0,
+            expected_question_count=expected_question_count,
+            questions_ready=False,
+            can_generate_questions=not has_sessions,
+            can_join=False,
+            blocked_reason="interview_started" if has_sessions else "questions_required",
+            user_message=(
+                "인터뷰가 이미 시작되어 질문을 다시 생성할 수 없습니다."
+                if has_sessions
+                else "프로젝트 분석과 RAG 인덱싱이 완료되었습니다. 질문 생성을 실행할 수 있습니다."
+            ),
+            check_targets=["질문 생성 실행", "LLM 응답 schema", "source refs 검증"],
+            retryable=not has_sessions,
+        )
 
     async def upload_zip(
         self, evaluation_id: str, upload: UploadFile
@@ -432,7 +582,35 @@ class ProjectEvaluationService:
                     rag_status=from_json(context_row.rag_status_json, {}),
                 ),
             ) from exc
+        if not questions:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "stage": "question_generation",
+                    "reason": "no_questions_generated",
+                    "message": "질문 생성 결과가 비어 있습니다.",
+                    "check_targets": [
+                        "LLM 응답 schema",
+                        "question_policy",
+                        "RAG 검색 결과",
+                        "source ref 검증",
+                    ],
+                    "rag_status": from_json(context_row.rag_status_json, {}),
+                },
+            )
         saved = self.repository.save_questions(evaluation_id, questions)
+        if len(saved) != len(questions):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "stage": "question_persistence",
+                    "reason": "question_save_count_mismatch",
+                    "message": "생성된 질문 수와 저장된 질문 수가 일치하지 않습니다.",
+                    "generated_count": len(questions),
+                    "saved_count": len(saved),
+                    "check_targets": ["DB 저장 상태", "질문 source refs", "질문 order_index"],
+                },
+            )
         self.repository.update_evaluation_status(
             evaluation_id, EvaluationStatus.QUESTIONS_GENERATED
         )
@@ -517,11 +695,7 @@ class ProjectEvaluationService:
                 detail="방 비밀번호가 올바르지 않습니다.",
             )
         _clear_auth_failures("room", evaluation_id, client_id)
-        if not self.repository.list_question_rows(evaluation_id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="아직 입장 가능한 인터뷰 질문이 생성되지 않았습니다.",
-            )
+        self._ensure_questions_ready_for_join(evaluation_id)
         session = self._create_session(evaluation_id, participant_name.strip())
         evaluation = self.get_evaluation(evaluation_id)
         return JoinEvaluationRead(
@@ -544,11 +718,7 @@ class ProjectEvaluationService:
         self, evaluation_id: str, participant_name: str = ""
     ) -> InterviewSessionRead:
         self.get_evaluation(evaluation_id)
-        if not self.repository.list_question_rows(evaluation_id):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="인터뷰를 시작하기 전에 질문을 먼저 생성해야 합니다.",
-            )
+        self._ensure_questions_ready_for_join(evaluation_id)
         session_token = _new_session_token()
         session = self.repository.create_session(
             evaluation_id,
@@ -560,6 +730,22 @@ class ProjectEvaluationService:
             evaluation_id, EvaluationStatus.INTERVIEWING
         )
         return session
+
+    def _ensure_questions_ready_for_join(self, evaluation_id: str) -> None:
+        question_count = len(self.repository.list_question_rows(evaluation_id))
+        expected_count = self.repository.get_question_policy(evaluation_id).total_question_count
+        if question_count == expected_count and question_count > 0:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "stage": "join",
+                "reason": "questions_not_ready",
+                "message": "인터뷰를 시작하기 전에 질문 정책에 맞는 질문을 먼저 생성해야 합니다.",
+                "question_count": question_count,
+                "expected_question_count": expected_count,
+            },
+        )
 
     def submit_turn(
         self,

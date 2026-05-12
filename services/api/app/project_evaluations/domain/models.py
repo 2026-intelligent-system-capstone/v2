@@ -215,6 +215,24 @@ class ProjectEvaluationRead(BaseModel):
     updated_at: datetime
 
 
+class ProjectEvaluationStatusRead(BaseModel):
+    evaluation_id: str
+    status: str
+    phase: str
+    has_artifacts: bool
+    has_context: bool
+    rag_status: dict[str, Any] = Field(default_factory=dict)
+    question_count: int
+    expected_question_count: int
+    questions_ready: bool
+    can_generate_questions: bool
+    can_join: bool
+    blocked_reason: str = ""
+    user_message: str
+    check_targets: list[str] = Field(default_factory=list)
+    retryable: bool = False
+
+
 class ProjectArtifactRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
