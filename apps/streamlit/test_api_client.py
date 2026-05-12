@@ -5,7 +5,9 @@ from apps.streamlit.api_client import (
     ApiClientError,
     create_evaluation,
     get_api_base_url,
+    get_evaluation_status,
     get_health,
+    list_questions,
 )
 
 
@@ -52,6 +54,64 @@ def test_get_health_raises_api_client_error_on_request_failure(
 
     with pytest.raises(ApiClientError, match="FastAPI 서버 상태를 확인할 수 없습니다."):
         get_health()
+
+
+def test_get_evaluation_status_sends_admin_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "evaluation_id": "evaluation-1",
+        "phase": "questions_ready",
+        "question_count": 6,
+        "can_join": True,
+    }
+
+    def fake_request(
+        method: str,
+        url: str,
+        timeout: int,
+        **kwargs: object,
+    ) -> FakeResponse:
+        assert method == "GET"
+        assert url == "http://localhost:8000/api/project-evaluations/evaluation-1/status"
+        assert timeout == 30
+        assert kwargs["headers"] == {"X-Admin-Password": "admin-pass"}
+        return FakeResponse(payload)
+
+    monkeypatch.delenv("API_BASE_URL", raising=False)
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    assert get_evaluation_status("evaluation-1", "admin-pass") == payload
+
+
+def test_list_questions_sends_admin_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = [{"id": "question-1", "question": "자료 기반 질문"}]
+
+    class FakeListResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> list[dict[str, object]]:
+            return payload
+
+    def fake_request(
+        method: str,
+        url: str,
+        timeout: int,
+        **kwargs: object,
+    ) -> FakeListResponse:
+        assert method == "GET"
+        assert url == "http://localhost:8000/api/project-evaluations/evaluation-1/questions"
+        assert timeout == 30
+        assert kwargs["headers"] == {"X-Admin-Password": "admin-pass"}
+        return FakeListResponse()
+
+    monkeypatch.delenv("API_BASE_URL", raising=False)
+    monkeypatch.setattr(requests, "request", fake_request)
+
+    assert list_questions("evaluation-1", "admin-pass") == payload
 
 
 def test_create_evaluation_includes_question_policy_payload(

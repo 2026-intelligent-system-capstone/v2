@@ -172,8 +172,12 @@ def extract_evaluation(evaluation_id: str, admin_password: str = "") -> dict[str
     )
 
 
-def get_context(evaluation_id: str) -> dict[str, object]:
-    return request_json_dict("GET", f"/api/project-evaluations/{evaluation_id}/context")
+def get_context(evaluation_id: str, admin_password: str = "") -> dict[str, object]:
+    return request_json_dict(
+        "GET",
+        f"/api/project-evaluations/{evaluation_id}/context",
+        headers={"X-Admin-Password": admin_password},
+    )
 
 
 def generate_questions(evaluation_id: str, admin_password: str = "") -> list[dict[str, object]]:
@@ -185,10 +189,24 @@ def generate_questions(evaluation_id: str, admin_password: str = "") -> list[dic
     )
 
 
-def get_questions(evaluation_id: str) -> list[dict[str, object]]:
-    return request_json_list(
-        "GET", f"/api/project-evaluations/{evaluation_id}/questions"
+def get_evaluation_status(evaluation_id: str, admin_password: str = "") -> dict[str, object]:
+    return request_json_dict(
+        "GET",
+        f"/api/project-evaluations/{evaluation_id}/status",
+        headers={"X-Admin-Password": admin_password},
     )
+
+
+def list_questions(evaluation_id: str, admin_password: str = "") -> list[dict[str, object]]:
+    return request_json_list(
+        "GET",
+        f"/api/project-evaluations/{evaluation_id}/questions",
+        headers={"X-Admin-Password": admin_password},
+    )
+
+
+def get_questions(evaluation_id: str) -> list[dict[str, object]]:
+    return list_questions(evaluation_id)
 
 
 def create_session(evaluation_id: str, admin_password: str = "") -> dict[str, object]:

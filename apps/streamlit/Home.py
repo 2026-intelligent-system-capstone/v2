@@ -1,6 +1,6 @@
 import os
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -14,9 +14,12 @@ from apps.streamlit.api_client import (
     extract_evaluation,
     generate_questions,
     get_api_base_url,
+    get_context,
+    get_evaluation_status,
     get_health,
     get_latest_report,
     join_evaluation,
+    list_questions,
     upload_zip,
     verify_admin,
 )
@@ -96,6 +99,10 @@ def init_state() -> None:
         "admin_password": "",
         "upload_result": None,
         "context": None,
+        "evaluation_status": None,
+        "question_generation_event": None,
+        "question_generation_error": None,
+        "last_operation": "",
         "questions": [],
         "joined_session": None,
         "report": None,
@@ -116,6 +123,85 @@ def call_api(action, *args):
     except ApiClientError as exc:
         render_api_error(exc)
         return None
+
+
+def call_api_capture_error(action, *args) -> tuple[object | None, ApiClientError | None]:
+    try:
+        return action(*args), None
+    except ApiClientError as exc:
+        return None, exc
+
+
+def persist_question_generation_error(evaluation_id: str, exc: ApiClientError) -> None:
+    detail = exc.detail
+    st.session_state["question_generation_error"] = {
+        "evaluation_id": evaluation_id,
+        "message": str(exc),
+        "detail": detail,
+    }
+
+
+def clear_question_generation_error() -> None:
+    st.session_state["question_generation_event"] = None
+    st.session_state["question_generation_error"] = None
+
+
+def render_persisted_generation_error(evaluation_id: str) -> None:
+    error = st.session_state.get("question_generation_error")
+    if not isinstance(error, dict) or error.get("evaluation_id") != evaluation_id:
+        return
+    detail = error.get("detail")
+    st.error("질문 생성 API 요청이 실패했습니다.")
+    if isinstance(detail, dict):
+        stage = detail.get("stage")
+        reason = detail.get("reason")
+        message = detail.get("message") or error.get("message")
+        cols = st.columns(2)
+        cols[0].metric("실패 단계", display_value(stage))
+        cols[1].metric("실패 사유", display_value(reason))
+        st.write(message)
+        check_targets = detail.get("check_targets", [])
+        if isinstance(check_targets, list) and check_targets:
+            st.markdown("**확인 대상**")
+            for target in check_targets:
+                st.markdown(f"- {target}")
+        extra = {key: value for key, value in detail.items() if key not in {"stage", "reason", "message", "check_targets"}}
+        if extra:
+            with st.expander("질문 생성 실패 상세"):
+                st.json(extra)
+        return
+    if isinstance(detail, list):
+        with st.expander("질문 생성 검증 오류", expanded=True):
+            st.json(detail)
+        return
+    st.write(display_value(error.get("message")))
+
+
+def fetch_api(action, *args) -> object | None:
+    try:
+        return action(*args)
+    except ApiClientError as exc:
+        st.session_state["last_operation"] = str(exc)
+        return None
+
+
+def refresh_professor_state(evaluation_id: str, admin_password: str) -> dict[str, object] | None:
+    st.session_state["last_operation"] = ""
+    st.session_state["evaluation_status"] = None
+    st.session_state["context"] = None
+    st.session_state["questions"] = []
+    status = fetch_api(get_evaluation_status, evaluation_id, admin_password)
+    if not isinstance(status, dict):
+        return None
+    st.session_state["evaluation_status"] = status
+    if bool(status.get("has_context")):
+        context = fetch_api(get_context, evaluation_id, admin_password)
+        if isinstance(context, dict):
+            st.session_state["context"] = context
+    if int(status.get("question_count", 0) or 0) > 0:
+        questions = fetch_api(list_questions, evaluation_id, admin_password)
+        st.session_state["questions"] = questions if isinstance(questions, list) else []
+    return status
 
 
 def render_api_error(exc: ApiClientError) -> None:
@@ -268,47 +354,173 @@ def render_rag_status(context: dict[str, object]) -> None:
     )
 
 
-def render_questions(questions: list[dict[str, object]]) -> None:
-    st.subheader("생성 질문 검토 보드")
-    st.caption("질문마다 Bloom 단계, 검증 의도, 기대 신호, 근거 파일을 한 화면에서 확인합니다.")
-    for i, q in enumerate(questions):
-        bloom_level = display_value(q.get("bloom_level"))
+def render_status_console(status: dict[str, object] | None) -> None:
+    if not isinstance(status, dict):
+        st.info("상태를 아직 불러오지 않았습니다. 방 생성 또는 관리자 확인 후 상태를 새로고침하세요.")
+        return
+    phase = str(status.get("phase", "-"))
+    can_join = bool(status.get("can_join"))
+    questions_ready = bool(status.get("questions_ready"))
+    message = display_value(status.get("user_message"))
+    if can_join:
+        st.success(message)
+    elif bool(status.get("retryable")):
+        st.info(message)
+    else:
+        st.warning(message)
+
+    rag_status = status.get("rag_status", {})
+    rag_text = "-"
+    if isinstance(rag_status, dict):
+        rag_text = str(rag_status.get("status") or rag_status.get("reason") or "-")
+    cols = st.columns(5)
+    cols[0].metric("현재 단계", phase)
+    cols[1].metric("저장 질문", int(status.get("question_count", 0) or 0))
+    cols[2].metric("기대 질문", int(status.get("expected_question_count", 0) or 0))
+    cols[3].metric("RAG", rag_text)
+    cols[4].metric("입장 가능", "가능" if questions_ready and can_join else "대기")
+
+    blocked_reason = str(status.get("blocked_reason", ""))
+    check_targets = status.get("check_targets", [])
+    if blocked_reason or check_targets:
+        with st.expander("상태 판단 근거"):
+            if blocked_reason:
+                st.markdown(f"**차단 사유:** `{blocked_reason}`")
+            if isinstance(check_targets, list) and check_targets:
+                st.markdown("**확인 대상**")
+                for target in check_targets:
+                    st.markdown(f"- {target}")
+
+
+def render_question_console(questions: list[dict[str, object]], status: dict[str, object] | None) -> None:
+    st.subheader("Evidence Console")
+    st.caption("질문 생성 여부와 각 질문의 코드·문서 근거를 한 번에 검토합니다.")
+    render_status_console(status)
+    if not questions:
+        render_question_empty_state(status)
+        return
+
+    overview_rows = []
+    bloom_counts: Counter[str] = Counter()
+    difficulty_counts: Counter[str] = Counter()
+    source_paths = set()
+    for index, question in enumerate(questions, start=1):
+        refs = question.get("source_refs", [])
+        refs_list = refs if isinstance(refs, list) else []
+        grouped_refs = group_source_refs_by_path(refs_list)
+        code_refs = [ref for ref in refs_list if _is_code_ref(ref)]
+        doc_refs = [ref for ref in refs_list if _is_document_ref(ref)]
+        bloom_level = display_value(question.get("bloom_level"))
         difficulty = DIFFICULTY_LABELS.get(
-            str(q.get("difficulty", "")), display_value(q.get("difficulty"))
+            str(question.get("difficulty", "")), display_value(question.get("difficulty"))
         )
-        refs = q.get("source_refs", [])
-        grouped_refs = group_source_refs_by_path(refs) if isinstance(refs, list) else {}
-        with st.container(border=True):
-            header_cols = st.columns([0.7, 4.3, 1.2, 1.2])
-            header_cols[0].markdown(f"### Q{i + 1}")
-            header_cols[1].markdown(f"### {display_value(q.get('question'))}")
-            header_cols[2].metric("Bloom", bloom_level)
-            header_cols[3].metric("난이도", difficulty)
+        bloom_counts[bloom_level] += 1
+        difficulty_counts[difficulty] += 1
+        source_paths.update(grouped_refs.keys())
+        overview_rows.append(
+            {
+                "Q": index,
+                "Bloom": bloom_level,
+                "난이도": difficulty,
+                "검증 초점": display_value(question.get("verification_focus")),
+                "근거 수": len(refs_list),
+                "code refs": len(code_refs),
+                "doc refs": len(doc_refs),
+            }
+        )
 
-            signal_cols = st.columns([1, 1])
-            with signal_cols[0]:
-                st.markdown("**검증 의도**")
-                st.write(display_value(q.get("intent")))
-            with signal_cols[1]:
-                st.markdown("**기대 답변 신호**")
-                st.write(display_value(q.get("expected_signal")))
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("질문 수", len(questions))
+    metric_cols[1].metric("Bloom 커버리지", f"{len([k for k, v in bloom_counts.items() if v])}/6")
+    metric_cols[2].metric("근거 파일", len(source_paths))
+    metric_cols[3].metric("문서-코드 근거", "확보" if all(row["code refs"] and row["doc refs"] for row in overview_rows) else "확인 필요")
 
-            st.markdown("**근거 파일 맵**")
-            if grouped_refs:
-                for path, path_refs in grouped_refs.items():
-                    with st.expander(f"{path} · {len(path_refs)}개 근거", expanded=i == 0):
-                        for ref in path_refs:
-                            location = _ref_location(ref)
-                            st.markdown(
-                                f"- {location or '위치 정보 없음'} · "
-                                f"{display_value(ref.get('artifact_role'))} / "
-                                f"{display_value(ref.get('chunk_type'))}"
-                            )
-                            snippet = str(ref.get("snippet", "")).strip()
-                            if snippet:
-                                st.caption(snippet)
-            else:
-                st.caption("연결된 source ref가 없습니다.")
+    left, right = st.columns([0.9, 1.6])
+    with left:
+        st.markdown("#### 단계 rail")
+        for phase, label in [
+            ("created", "방 생성"),
+            ("uploaded", "자료 업로드"),
+            ("context_ready", "분석 완료"),
+            ("questions_ready", "질문 저장"),
+        ]:
+            marker = "●" if isinstance(status, dict) and status.get("phase") == phase else "○"
+            st.markdown(f"{marker} **{label}** `{phase}`")
+        st.markdown("#### Bloom 분포")
+        st.dataframe(
+            [{"Bloom": level, "문항 수": bloom_counts.get(level, 0)} for level in BLOOM_LEVELS],
+            hide_index=True,
+            width="stretch",
+        )
+        st.markdown("#### 난이도 분포")
+        st.dataframe(
+            [{"난이도": key, "문항 수": value} for key, value in difficulty_counts.items()],
+            hide_index=True,
+            width="stretch",
+        )
+    with right:
+        st.markdown("#### 질문 overview")
+        st.dataframe(overview_rows, hide_index=True, width="stretch")
+        selected = st.radio(
+            "질문 dossier 선택",
+            options=list(range(len(questions))),
+            format_func=lambda index: f"Q{index + 1} · {display_value(questions[index].get('bloom_level'))}",
+            horizontal=True,
+        )
+        render_question_dossier(questions[int(selected)], int(selected) + 1)
+
+
+def render_question_empty_state(status: dict[str, object] | None) -> None:
+    if not isinstance(status, dict):
+        st.info("관리자 확인 후 DB 기준 질문 상태를 조회합니다.")
+        return
+    phase = str(status.get("phase", ""))
+    if phase == "created":
+        st.warning("아직 zip 자료가 업로드되지 않아 질문을 만들 수 없습니다.")
+    elif phase == "uploaded":
+        st.info("자료 업로드는 완료됐습니다. context 생성 및 질문 만들기 버튼으로 분석을 시작하세요.")
+    elif phase in {"rag_not_ready", "indexing_failed"}:
+        st.error(display_value(status.get("user_message")))
+    elif phase == "context_ready":
+        st.info("분석은 완료됐지만 아직 저장된 질문이 없습니다. 질문 생성을 실행하세요.")
+    else:
+        st.warning("DB에서 저장된 질문을 찾지 못했습니다. 상태를 새로고침하거나 질문 생성을 다시 실행하세요.")
+
+
+def render_question_dossier(question: dict[str, object], index: int) -> None:
+    st.markdown(f"#### Q{index}. {display_value(question.get('question'))}")
+    detail_cols = st.columns(2)
+    with detail_cols[0]:
+        st.markdown("**검증 의도**")
+        st.write(display_value(question.get("intent")))
+        st.markdown("**검증 초점**")
+        st.write(display_value(question.get("verification_focus")))
+    with detail_cols[1]:
+        st.markdown("**기대 답변 신호**")
+        st.write(display_value(question.get("expected_signal")))
+        st.markdown("**기대 근거**")
+        st.write(display_value(question.get("expected_evidence")))
+    st.markdown("**Source ref 요구사항**")
+    st.caption(display_value(question.get("source_ref_requirements")))
+
+    refs = question.get("source_refs", [])
+    grouped_refs = group_source_refs_by_path(refs if isinstance(refs, list) else [])
+    st.markdown("**근거 파일 맵**")
+    if not grouped_refs:
+        st.caption("연결된 source ref가 없습니다.")
+        return
+    for path, path_refs in grouped_refs.items():
+        with st.expander(f"{path} · {len(path_refs)}개 근거", expanded=False):
+            for ref in path_refs:
+                location = _ref_location(ref)
+                st.markdown(
+                    f"- {location or '위치 정보 없음'} · "
+                    f"{display_value(ref.get('artifact_role'))} / "
+                    f"{display_value(ref.get('chunk_type'))}"
+                )
+                snippet = str(ref.get("snippet", "")).strip()
+                if snippet:
+                    st.caption(snippet)
 
 
 def group_source_refs_by_path(refs: list[object]) -> dict[str, list[dict[str, object]]]:
@@ -325,6 +537,24 @@ def _ref_location(ref: dict[str, object]) -> str:
     if ref.get("page_or_slide"):
         return f" ({ref['page_or_slide']})"
     return ""
+
+
+def _is_code_ref(ref: object) -> bool:
+    if not isinstance(ref, dict):
+        return False
+    return str(ref.get("artifact_role", "")) in {
+        "codebase_source",
+        "codebase_test",
+        "codebase_config",
+        "codebase_api_spec",
+    }
+
+
+def _is_document_ref(ref: object) -> bool:
+    if not isinstance(ref, dict):
+        return False
+    role = str(ref.get("artifact_role", ""))
+    return role == "codebase_overview" or role.startswith("project_")
 
 
 def render_professor() -> None:
@@ -367,7 +597,7 @@ def render_professor() -> None:
                     for level in BLOOM_LEVELS
                 ],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
 
         with st.form("create_room_form"):
@@ -387,10 +617,8 @@ def render_professor() -> None:
                 st.warning("Bloom 비율이 모두 0이면 방을 만들 수 없습니다.")
             else:
                 question_policy = {
-                    "total_questions": int(total_questions),
+                    "total_question_count": int(total_questions),
                     "bloom_ratios": bloom_ratios,
-                    "planned_counts": planned_counts,
-                    "allocation_rule": "largest_remainder",
                 }
                 with st.spinner("방을 만들고 zip 자료를 업로드하는 중입니다..."):
                     evaluation = call_api(
@@ -412,10 +640,12 @@ def render_professor() -> None:
                             admin_password,
                         )
                         if upload_result:
+                            clear_question_generation_error()
                             st.session_state["evaluation"] = evaluation
                             st.session_state["upload_result"] = upload_result
                             st.session_state["admin_verified"] = True
                             st.session_state["admin_password"] = admin_password
+                            refresh_professor_state(str(evaluation["id"]), admin_password)
                             st.success(f"방 생성 완료 · 평가 ID: {evaluation['id']}")
                             st.rerun()
 
@@ -430,9 +660,11 @@ def render_professor() -> None:
             else:
                 verified = call_api(verify_admin, evaluation_id, admin_password)
                 if verified:
+                    clear_question_generation_error()
                     st.session_state["evaluation"] = {"id": evaluation_id}
                     st.session_state["admin_verified"] = True
                     st.session_state["admin_password"] = admin_password
+                    refresh_professor_state(evaluation_id, admin_password)
                     st.success("관리자 확인 완료")
                     st.rerun()
 
@@ -460,20 +692,39 @@ def render_professor() -> None:
     if isinstance(upload_result, dict):
         show_artifact_breakdown(upload_result)
     else:
-        st.caption("기존 방은 현재 화면에서 업로드 결과를 다시 불러오지 않습니다. 분석/질문 생성은 계속 진행할 수 있습니다.")
+        st.caption("기존 방은 업로드 결과 요약은 복구하지 않지만, DB 기준 status/context/questions는 다시 불러옵니다.")
+
+    if st.button("상태 새로고침", width="stretch"):
+        refresh_professor_state(evaluation_id, admin_password)
+        st.rerun()
+
+    status = st.session_state.get("evaluation_status")
+    last_operation = st.session_state.get("last_operation")
+    if last_operation:
+        st.warning(str(last_operation))
 
     if st.button("context 생성 및 질문 만들기", type="primary"):
         with st.spinner("자료를 요약하고 질문을 생성하는 중입니다..."):
+            clear_question_generation_error()
             context = call_api(extract_evaluation, evaluation_id, admin_password)
             if context:
                 st.session_state["context"] = context
-                questions = call_api(generate_questions, evaluation_id, admin_password)
-                if questions:
-                    st.session_state["questions"] = questions
-                    st.success("질문 생성 완료")
-                else:
+                questions, question_error = call_api_capture_error(generate_questions, evaluation_id, admin_password)
+                if question_error is not None:
+                    persist_question_generation_error(evaluation_id, question_error)
+                    st.session_state["question_generation_event"] = "질문 생성 API 요청이 실패했습니다. 아래 실패 단계와 확인 대상을 확인하세요."
+                elif isinstance(questions, list) and not questions:
+                    st.session_state["question_generation_event"] = "질문 생성 요청은 끝났지만 응답 질문 수가 0개입니다."
                     st.session_state["questions"] = []
-                st.rerun()
+                elif isinstance(questions, list):
+                    st.session_state["question_generation_event"] = f"질문 생성 응답 {len(questions)}개를 받았습니다. DB 기준으로 다시 조회했습니다."
+            refresh_professor_state(evaluation_id, admin_password)
+            st.rerun()
+
+    generation_event = st.session_state.get("question_generation_event")
+    if generation_event:
+        st.caption(str(generation_event))
+    render_persisted_generation_error(evaluation_id)
 
     if st.session_state.get("context"):
         ctx = st.session_state["context"]
@@ -497,8 +748,11 @@ def render_professor() -> None:
                     st.markdown(f"- {item}")
 
     questions = st.session_state.get("questions", [])
-    if isinstance(questions, list) and questions:
-        render_questions(questions)
+    status = st.session_state.get("evaluation_status")
+    render_question_console(
+        questions if isinstance(questions, list) else [],
+        status if isinstance(status, dict) else None,
+    )
 
     if st.button("최신 리포트 확인"):
         with st.spinner("리포트를 불러오는 중..."):
@@ -553,9 +807,9 @@ def render_report(report: dict[str, object]) -> None:
     st.subheader("요약")
     st.write(report["summary"])
     st.subheader("프로젝트 영역별 신뢰도")
-    st.dataframe(report.get("area_analyses", []), use_container_width=True)
+    st.dataframe(report.get("area_analyses", []), width="stretch")
     st.subheader("질문별 평가")
-    st.dataframe(report.get("question_evaluations", []), use_container_width=True)
+    st.dataframe(report.get("question_evaluations", []), width="stretch")
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("강점")
@@ -598,12 +852,12 @@ if mode == "home":
     with col1:
         st.subheader("교수자")
         st.write("방을 만들고 zip 자료를 업로드한 뒤, 자료 기반 질문과 리포트를 관리합니다.")
-        if st.button("교수자: 방 만들기/관리", type="primary", use_container_width=True):
+        if st.button("교수자: 방 만들기/관리", type="primary", width="stretch"):
             set_mode("professor")
     with col2:
         st.subheader("학생/지원자")
         st.write("평가 ID와 방 비밀번호로 입장해 실시간 음성 인터뷰를 진행합니다.")
-        if st.button("학생: 방 입장", use_container_width=True):
+        if st.button("학생: 방 입장", width="stretch"):
             set_mode("student")
 elif mode == "professor":
     if st.button("시작 화면으로 돌아가기"):
