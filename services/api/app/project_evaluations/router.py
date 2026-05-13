@@ -3,7 +3,9 @@ import asyncio
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from services.api.app.database import get_session
@@ -34,7 +36,6 @@ from services.api.app.project_evaluations.interview.speech_service import (
     SpeechService,
 )
 from services.api.app.project_evaluations.interview.turn_flow import InterviewTurnFlow
-from services.api.app.project_evaluations.realtime.proxy import run_realtime_session
 from services.api.app.project_evaluations.persistence.repository import (
     ProjectEvaluationRepository,
 )
@@ -345,34 +346,47 @@ def complete_interview(
     return service.complete_session(evaluation_id, session_id, session_token, request_client_id)
 
 
-@router.websocket("/ws/interview/{evaluation_id}/{session_id}")
-async def realtime_interview_websocket(
-    websocket: WebSocket,
+class InterviewSpeechSynthesisRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+    voice: str | None = Field(default=None, max_length=64)
+    instructions: str | None = Field(default=None, max_length=2000)
+
+
+@router.post(
+    "/{evaluation_id}/sessions/{session_id}/interview/tts",
+    responses={200: {"content": {"audio/mpeg": {}}}},
+)
+async def synthesize_interview_speech(
     evaluation_id: str,
     session_id: str,
-) -> None:
-    session_factory = websocket.app.state.session_factory
-    settings = websocket.app.state.settings
-    session_token = websocket.cookies.get(f"interview_session_{session_id}") or websocket.headers.get(
-        "x-session-token"
-    )
-    client_host = websocket.client.host if websocket.client else "local"
-
-    with session_factory() as db_session:
-        ProjectEvaluationService(
-            ProjectEvaluationRepository(db_session),
-            settings,
-        ).ensure_session(evaluation_id, session_id, session_token, client_host)
-
-    await run_realtime_session(
-        websocket,
-        session_factory,
-        settings,
-        evaluation_id,
-        session_id,
-        session_token or "",
-        client_host,
-        model=settings.OPENAI_REALTIME_MODEL,
+    payload: InterviewSpeechSynthesisRequest,
+    service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
+    session_token: Annotated[str | None, Depends(interview_session_token)],
+) -> Response:
+    service.ensure_session(evaluation_id, session_id, session_token, request_client_id)
+    speech_service = SpeechService(service.settings)
+    try:
+        audio_bytes = await asyncio.to_thread(
+            speech_service.synthesize_speech,
+            payload.text,
+            payload.voice,
+            payload.instructions,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "stage": "audio_synthesis",
+                "model": service.settings.OPENAI_TTS_MODEL,
+                "message": "음성 합성 실패: TTS 처리 중 오류가 발생했습니다.",
+                "error": str(exc),
+            },
+        ) from exc
+    return Response(
+        content=audio_bytes,
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "no-store"},
     )
 
 

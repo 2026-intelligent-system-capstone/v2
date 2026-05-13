@@ -47,3 +47,33 @@ class SpeechService:
         if not transcript.strip():
             raise RuntimeError("오디오 전사 결과가 비어 있습니다.")
         return transcript.strip()
+
+    def synthesize_speech(
+        self,
+        text: str,
+        voice: str | None = None,
+        instructions: str | None = None,
+    ) -> bytes:
+        if self._client is None:
+            raise RuntimeError("OpenAI API key가 설정되지 않아 음성 합성을 수행할 수 없습니다.")
+        if not text or not text.strip():
+            raise RuntimeError("음성 합성 입력 텍스트가 비어 있습니다.")
+        create_kwargs: dict[str, Any] = {
+            "model": self.settings.OPENAI_TTS_MODEL,
+            "voice": voice or self.settings.OPENAI_TTS_VOICE,
+            "input": text,
+            "response_format": "mp3",
+        }
+        resolved_instructions = instructions or self.settings.OPENAI_TTS_INSTRUCTIONS
+        if resolved_instructions:
+            create_kwargs["instructions"] = resolved_instructions
+        response = self._client.audio.speech.create(**create_kwargs)
+        if hasattr(response, "read"):
+            audio_bytes = response.read()
+        elif hasattr(response, "content"):
+            audio_bytes = response.content
+        else:
+            audio_bytes = bytes(response)
+        if not audio_bytes:
+            raise RuntimeError("음성 합성 결과가 비어 있습니다.")
+        return audio_bytes
