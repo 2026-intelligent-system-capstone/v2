@@ -27,7 +27,7 @@ services:
       retries: 5
       start_period: 20s
     networks:
-      - app
+      - proxy
 
   streamlit:
     container_name: dialearn-streamlit
@@ -61,7 +61,7 @@ services:
       retries: 5
       start_period: 20s
     networks:
-      - app
+      - proxy
 
   qdrant:
     image: qdrant/qdrant:v1.15.4
@@ -80,7 +80,7 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - app
+      - proxy
 
 volumes:
   dialearn_app_data:
@@ -91,6 +91,6 @@ volumes:
     name: dialearn_qdrant_storage
 
 networks:
-  app:
+  proxy:
     external: true
-    name: app
+    name: proxy
