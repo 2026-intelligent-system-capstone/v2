@@ -37,7 +37,6 @@ cp .env.example .env
 | 변수 | 설명 | 기본값 |
 |------|------|--------|
 | `OPENAI_API_KEY` | OpenAI API 키 | (필수) |
-| `OPENAI_REALTIME_MODEL` | Realtime 인터뷰 모델 | `gpt-4o-realtime-preview-2024-12-17` |
 | `QDRANT_URL` | Qdrant 벡터 DB URL (선택) | `http://localhost:6333` |
 | `APP_SQLITE_PATH` | SQLite DB 경로 | `data/app.db` |
 

@@ -6,6 +6,7 @@ import secrets
 import time
 from collections import Counter
 from collections.abc import Callable
+from urllib.parse import quote
 
 from fastapi import HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +24,7 @@ from services.api.app.project_evaluations.domain.models import (
     EvaluationReportRead,
     EvaluationStatus,
     ExtractedProjectContextRead,
+    FollowUpExchange,
     InterviewQuestionRead,
     InterviewSessionRead,
     InterviewTurnCreate,
@@ -62,6 +64,7 @@ PASSWORD_HASH_ITERATIONS = 120_000
 AUTH_WINDOW_SECONDS = 60
 AUTH_MAX_FAILURES = 8
 _AUTH_FAILURES: dict[tuple[str, str, str], list[float]] = {}
+_ABORT_UNANSWERED_TEXT = "(미응답)"
 
 
 def _safe_error_message(exc: Exception, prefix: str) -> str:
@@ -704,10 +707,14 @@ class ProjectEvaluationService:
         self._ensure_questions_ready_for_join(evaluation_id)
         session = self._create_session(evaluation_id, participant_name.strip())
         evaluation = self.get_evaluation(evaluation_id)
+        token_qs = quote(session.session_token, safe="")
         return JoinEvaluationRead(
             evaluation=evaluation,
             session=session,
-            interview_url_path=f"/interview/{evaluation_id}/{session.id}/open",
+            interview_url_path=(
+                f"/interview/{evaluation_id}/{session.id}/enter"
+                f"?session_token={token_qs}"
+            ),
         )
 
     def create_session(
@@ -968,9 +975,20 @@ class ProjectEvaluationService:
                 question = questions_by_id.get(turn.question_id)
                 if question is None:
                     raise RuntimeError(f"최종 채점 대상 질문을 찾을 수 없습니다. question_id={turn.question_id}")
-                exchange = turn.conversation_history or QuestionExchange(
-                    student_answer=turn.answer_text.strip() or "(답변 없음)"
-                )
+                conversation_data = from_json(turn.conversation_history_json, {})
+                if conversation_data:
+                    follow_ups = [
+                        FollowUpExchange(**item)
+                        for item in conversation_data.get("follow_ups", [])
+                    ]
+                    exchange = QuestionExchange(
+                        student_answer=str(conversation_data.get("student_answer", "")),
+                        follow_ups=follow_ups,
+                    )
+                else:
+                    exchange = QuestionExchange(
+                        student_answer=turn.answer_text.strip() or "(답변 없음)"
+                    )
                 finalized = finalize_oral_evaluation(
                     question,
                     turn.answer_text,
@@ -1028,13 +1046,50 @@ class ProjectEvaluationService:
             summary=str(report["summary"]),
             area_analyses=list(report["area_analyses"]),
             question_evaluations=list(report["question_evaluations"]),
-            bloom_summary=dict(report["bloom_summary"]),
-            rubric_summary=dict(report["rubric_summary"]),
+            bloom_summary=list(report["bloom_summary"]),
+            rubric_summary=list(report["rubric_summary"]),
             evidence_alignment=list(report["evidence_alignment"]),
             strengths=list(report["strengths"]),
             suspicious_points=list(report["suspicious_points"]),
             recommended_followups=list(report["recommended_followups"]),
         )
+
+    def abort_session(
+        self,
+        evaluation_id: str,
+        session_id: str,
+        session_token: str | None = None,
+        client_id: str = "local",
+    ) -> EvaluationReportRead:
+        """학생 조기 종료. 인터뷰 진행 단계(의도 분류·꼬리질문 등) 없이 남은
+        질문을 즉시 미응답으로 채우고, 지금까지 수집된 turn 데이터로
+        ``complete_session``을 통해 정상 평가 리포트를 생성한다.
+        """
+        session = self.ensure_session(evaluation_id, session_id, session_token, client_id)
+        if session.status.value == "completed":
+            existing_report = self.repository.get_latest_report_for_session(session_id)
+            if existing_report is not None:
+                return existing_report
+        while True:
+            session = self.ensure_session(
+                evaluation_id, session_id, session_token, client_id
+            )
+            questions = self.repository.list_question_rows(evaluation_id)
+            if session.current_question_index >= len(questions):
+                break
+            question_id = questions[session.current_question_index].id
+            self.submit_turn(
+                evaluation_id,
+                session_id,
+                InterviewTurnCreate(
+                    question_id=question_id,
+                    answer_text=_ABORT_UNANSWERED_TEXT,
+                ),
+                session_token,
+                client_id,
+                allow_follow_up_required=True,
+            )
+        return self.complete_session(evaluation_id, session_id, session_token, client_id)
 
     def get_latest_report(self, evaluation_id: str) -> EvaluationReportRead:
         self.get_evaluation(evaluation_id)

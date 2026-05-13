@@ -7,10 +7,14 @@ class ApiSettings(BaseSettings):
     OPENAI_ANALYSIS_MODEL: str = "gpt-4o-mini"
     OPENAI_QUESTION_MODEL: str = "gpt-4o-mini"
     OPENAI_EVAL_MODEL: str = "gpt-4o-mini"
-    OPENAI_REALTIME_MODEL: str = "gpt-realtime-1.5"
     OPENAI_TRANSCRIBE_MODEL: str = "gpt-4o-transcribe"
     OPENAI_TRANSCRIBE_LANGUAGE: str = "ko"
     OPENAI_AUDIO_MAX_UPLOAD_MB: int = 25
+    OPENAI_TTS_MODEL: str = "gpt-4o-mini-tts"
+    OPENAI_TTS_VOICE: str = "coral"
+    OPENAI_TTS_INSTRUCTIONS: str = (
+        "전문 면접관처럼 차분하고 명확한 톤으로, 자연스러운 한국어 억양으로 말해 주세요."
+    )
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_COLLECTION_NAME: str = "project_evaluation_chunks"
     RAG_ENABLED: bool = True
