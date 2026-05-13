@@ -34,6 +34,10 @@ def classify_student_intent(text: str, llm: LlmClient) -> StudentIntent:
         max_tokens=8,
     )
     normalized = response.strip().lower()
+    if not normalized:
+        raise RuntimeError(
+            f"학생 답변 의도 판별 LLM 응답이 비어 있습니다: {response!r}"
+        )
     try:
         return StudentIntent(normalized)
     except ValueError as exc:

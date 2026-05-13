@@ -1,4 +1,12 @@
-"""Browser interview routes."""
+"""학생 인터뷰 진입 라우터.
+
+기본 진입 경로는 단계형(HTTP) 평가 화면이다.
+- `/interview/{eval}/{session}/open` — 세션 토큰 입력 → 쿠키 설정 → 단계형 화면으로 redirect
+- `/interview/{eval}/{session}` — 단계형 인터뷰 화면 (HTTP API 사용)
+- `/interview/{eval}/{session}/voice` — 음성 보조 화면 (선택). 평가 상태머신은
+  여전히 HTTP 단계형 core가 권한자다. 음성 transport가 실패해도 단계형 화면에서
+  인터뷰를 이어 갈 수 있다.
+"""
 
 from __future__ import annotations
 
@@ -10,487 +18,869 @@ from services.api.app.project_evaluations.persistence.repository import (
 )
 from services.api.app.project_evaluations.service import ProjectEvaluationService
 
-router = APIRouter(tags=["step-interview"])
+router = APIRouter(tags=["realtime-interview"])
 
-# ---------------------------------------------------------------------------
-# HTML interview page
-# NOTE: plain string — NOT an f-string.  CSS and JS use literal { } braces.
-#       IDs are extracted from window.location.pathname in JS (no substitution).
-# ---------------------------------------------------------------------------
 
-_HTML = """<!DOCTYPE html>
+_STAGED_HTML = """\
+<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>단계형 프로젝트 인터뷰</title>
+<title>프로젝트 평가 인터뷰</title>
 <style>
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  min-height: 100vh;
-  background: radial-gradient(circle at top left, #1e3a8a 0, #0f172a 32rem);
-  color: #e2e8f0;
-  font-family: Inter, "Segoe UI", system-ui, sans-serif;
-  padding: 28px 16px 48px;
-}
-main, #report-view { width: min(920px, 100%); margin: 0 auto; }
-header { margin-bottom: 22px; }
-h1 { margin: 0 0 8px; color: #bae6fd; font-size: clamp(1.7rem, 4vw, 2.7rem); }
-.subtitle { margin: 0; color: #94a3b8; line-height: 1.6; }
-.panel {
-  background: rgba(15, 23, 42, .86);
-  border: 1px solid rgba(148, 163, 184, .22);
-  border-radius: 18px;
-  box-shadow: 0 20px 70px rgba(2, 6, 23, .35);
-  padding: 22px;
-}
-#status-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
-#status-dot { width: 12px; height: 12px; border-radius: 50%; background: #64748b; }
-#status-dot.ready { background: #22c55e; }
-#status-dot.busy { background: #a78bfa; animation: pulse 1s infinite; }
-#status-dot.error { background: #ef4444; }
-#status-text { color: #cbd5e1; font-size: .95rem; }
-.error-card {
-  display: grid;
-  gap: 10px;
-  margin-bottom: 16px;
-  padding: 14px;
-  border-radius: 14px;
-  border: 1px solid rgba(248, 113, 113, .4);
-  background: rgba(127, 29, 29, .26);
-}
-.error-card strong { color: #fecaca; }
-.error-card p { margin: 0; color: #fee2e2; line-height: 1.5; white-space: pre-wrap; }
-.error-card[hidden] { display: none; }
-.error-actions { display: flex; justify-content: flex-end; }
-@keyframes pulse { 50% { opacity: .42; } }
-.progress { color: #7dd3fc; font-size: .86rem; font-weight: 700; margin-bottom: 10px; }
-.question-card {
-  background: linear-gradient(135deg, rgba(14, 165, 233, .18), rgba(59, 130, 246, .08));
-  border: 1px solid rgba(125, 211, 252, .24);
-  border-radius: 16px;
-  padding: 18px;
-  margin-bottom: 16px;
-}
-.question-card h2 { margin: 0 0 10px; font-size: 1.25rem; color: #f8fafc; line-height: 1.45; }
-.question-meta { color: #93c5fd; font-size: .86rem; line-height: 1.5; }
-#turn-history { display: grid; gap: 10px; margin-bottom: 16px; }
-.turn {
-  border-left: 3px solid #38bdf8;
-  background: rgba(30, 41, 59, .72);
-  border-radius: 12px;
-  padding: 12px 14px;
-}
-.turn strong { display: block; color: #bfdbfe; margin-bottom: 6px; }
-.turn p { margin: 0; color: #dbeafe; white-space: pre-wrap; line-height: 1.55; }
-.prompt-box {
-  display: none;
-  background: rgba(67, 56, 202, .22);
-  border: 1px solid rgba(167, 139, 250, .32);
-  border-radius: 14px;
-  padding: 14px;
-  margin-bottom: 14px;
-  color: #ddd6fe;
-  line-height: 1.5;
-}
-textarea {
-  width: 100%;
-  min-height: 150px;
-  resize: vertical;
-  border-radius: 16px;
-  border: 1px solid #334155;
-  background: #020617;
-  color: #e2e8f0;
-  padding: 14px;
-  font: inherit;
-  line-height: 1.6;
-}
-textarea:focus, button:focus-visible, input:focus-visible { outline: 3px solid rgba(125, 211, 252, .35); }
-.audio-row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 10px;
-  align-items: center;
-  margin: 12px 0;
-}
-input[type="file"] {
-  width: 100%;
-  border: 1px dashed #475569;
-  border-radius: 12px;
-  padding: 10px;
-  color: #cbd5e1;
-}
-.controls { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; margin-top: 14px; }
-button {
-  border: 0;
-  border-radius: 999px;
-  padding: 10px 18px;
-  font-weight: 800;
-  cursor: pointer;
-  color: #0f172a;
-  background: #7dd3fc;
-}
-button.secondary { background: #c4b5fd; }
-button.danger { background: #fca5a5; }
-button.ghost { background: #334155; color: #e2e8f0; }
-button:disabled { opacity: .46; cursor: not-allowed; }
-#report-view { display: none; flex-direction: column; gap: 16px; }
-.report-header, .section { background: rgba(15, 23, 42, .88); border-radius: 16px; padding: 20px; border: 1px solid #1e3a5f; }
-.verdict { font-size: 1.8rem; font-weight: 900; margin-bottom: 8px; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; padding: 24px 16px; display: flex; flex-direction: column; align-items: center; }
+h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; margin-bottom: 4px; }
+.subtitle { font-size: .85rem; color: #64748b; margin-bottom: 20px; }
+#main { width: 100%; max-width: 820px; display: flex; flex-direction: column; gap: 16px; }
+.progress { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #1e293b; border-radius: 10px; font-size: .85rem; color: #94a3b8; }
+.progress strong { color: #e2e8f0; font-weight: 600; }
+.question-card { background: #1e293b; border-radius: 12px; padding: 20px; }
+.question-card .label { font-size: .75rem; font-weight: 600; color: #7dd3fc; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+.question-card .text { font-size: 1.05rem; line-height: 1.55; color: #e2e8f0; white-space: pre-wrap; }
+.follow-up-card { background: #2d1f69; border-radius: 12px; padding: 16px 20px; }
+.follow-up-card .label { font-size: .75rem; font-weight: 600; color: #c4b5fd; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
+.follow-up-card .text { font-size: .95rem; line-height: 1.55; color: #ede9fe; white-space: pre-wrap; }
+.info-card { background: #14532d; border-radius: 12px; padding: 14px 18px; color: #d1fae5; font-size: .9rem; line-height: 1.55; display: none; }
+.info-card.show { display: block; }
+.draft { padding: 10px 14px; background: #0f172a; border: 1px dashed #334155; border-radius: 8px; font-size: .85rem; color: #94a3b8; white-space: pre-wrap; min-height: 1.4rem; }
+form { display: flex; flex-direction: column; gap: 10px; }
+textarea { width: 100%; min-height: 140px; resize: vertical; padding: 12px 14px; border-radius: 10px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: .95rem; font-family: inherit; line-height: 1.5; }
+textarea:focus { outline: none; border-color: #7dd3fc; box-shadow: 0 0 0 2px rgba(125,211,252,.25); }
+.actions { display: flex; gap: 10px; justify-content: space-between; flex-wrap: wrap; }
+.actions .right { display: flex; gap: 10px; }
+button { padding: 10px 18px; border: none; border-radius: 8px; font-size: .9rem; font-weight: 600; cursor: pointer; transition: background .15s, opacity .15s; }
+button.primary { background: #2563eb; color: #fff; }
+button.primary:hover { background: #1d4ed8; }
+button.ghost { background: transparent; color: #94a3b8; border: 1px solid #334155; }
+button.ghost:hover { color: #e2e8f0; border-color: #7dd3fc; }
+button.danger { background: #dc2626; color: #fff; }
+button.danger:hover { background: #b91c1c; }
+button:disabled { opacity: .55; cursor: default; }
+.error { padding: 10px 14px; background: #450a0a; border-radius: 8px; color: #fca5a5; font-size: .85rem; display: none; }
+.error.show { display: block; }
+#report-view { width: 100%; max-width: 820px; display: none; flex-direction: column; gap: 18px; }
+.report-header { padding: 22px; background: #1e293b; border-radius: 14px; text-align: center; }
+.verdict { font-size: 1.7rem; font-weight: 800; margin-bottom: 8px; }
 .verdict.pass { color: #34d399; }
 .verdict.caution { color: #fbbf24; }
 .verdict.fail { color: #f87171; }
-.score-badge { color: #cbd5e1; font-weight: 700; }
-.section h3 { margin: 0 0 12px; color: #7dd3fc; }
-.section p, .section li { color: #cbd5e1; line-height: 1.65; }
-.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-@media (max-width: 720px) {
-  body { padding-inline: 12px; }
-  .panel { padding: 16px; }
-  .grid2, .audio-row { grid-template-columns: 1fr; }
-  .controls { justify-content: stretch; }
-  button { width: 100%; }
-}
+.score-badge { display: inline-block; padding: 4px 14px; border-radius: 18px; font-size: .92rem; font-weight: 600; background: #0f172a; color: #94a3b8; }
+.section { background: #1e293b; border-radius: 12px; padding: 18px; }
+.section h3 { font-size: 1rem; font-weight: 700; color: #7dd3fc; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #1e3a5f; }
+.section p { font-size: .9rem; line-height: 1.7; color: #cbd5e1; }
+table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+th { text-align: left; padding: 8px 10px; background: #0f172a; color: #94a3b8; font-weight: 600; }
+td { padding: 8px 10px; border-top: 1px solid #1e3a5f; color: #cbd5e1; vertical-align: top; }
+ul.bullet { padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
+ul.bullet li { font-size: .88rem; color: #cbd5e1; line-height: 1.5; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: .75rem; font-weight: 600; }
+.tag.pass { background: #14532d; color: #86efac; }
+.tag.caution { background: #451a03; color: #fbbf24; }
+.tag.fail { background: #450a0a; color: #f87171; }
+.muted { color: #64748b; font-size: .82rem; }
+.voice-link { font-size: .82rem; color: #7dd3fc; text-decoration: none; }
+.voice-link:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
-<main id="main">
-  <header>
-    <h1>프로젝트 수행 진위 평가 — 단계형 인터뷰</h1>
-    <p class="subtitle">질문을 확인한 뒤 텍스트로 답변하세요. 필요하면 녹음 파일을 업로드해 답변 칸에 전사할 수 있습니다.</p>
-  </header>
-  <section class="panel" aria-live="polite">
-    <div id="status-bar">
-      <div id="status-dot" class="busy"></div>
-      <span id="status-text">인터뷰 상태를 불러오는 중...</span>
-    </div>
-    <section id="error-card" class="error-card" hidden>
-      <strong>인터뷰 처리 중 오류가 발생했습니다.</strong>
-      <p id="error-message"></p>
-      <div class="error-actions">
-        <button id="retry-btn" class="ghost" type="button" onclick="retryCurrentAction()">다시 시도</button>
+<h1>프로젝트 평가 인터뷰</h1>
+<p class="subtitle">질문에 텍스트로 답변하세요. 단계별로 진행됩니다.</p>
+
+<div id="main">
+  <div class="progress" id="progress">세션 상태를 불러오는 중입니다...</div>
+  <div class="error" id="error"></div>
+  <div class="info-card" id="info"></div>
+  <div class="question-card" id="question-card" style="display:none">
+    <div class="label" id="question-label">질문</div>
+    <div class="text" id="question-text"></div>
+  </div>
+  <div class="follow-up-card" id="follow-up-card" style="display:none">
+    <div class="label">꼬리질문</div>
+    <div class="text" id="follow-up-text"></div>
+  </div>
+  <div class="draft" id="draft" style="display:none"></div>
+  <form id="answer-form">
+    <textarea id="answer" placeholder="여기에 답변을 입력하세요" required></textarea>
+    <div class="actions">
+      <button type="button" class="danger" id="end-btn">인터뷰 종료</button>
+      <div class="right">
+        <button type="submit" class="primary" id="submit-btn">답변 제출</button>
       </div>
-    </section>
-    <div id="turn-history"></div>
-    <div id="question-area"></div>
-    <div id="mode-prompt" class="prompt-box"></div>
-    <label for="answer-input">답변</label>
-    <textarea id="answer-input" placeholder="현재 질문에 대한 답변을 입력하세요."></textarea>
-    <div class="audio-row">
-      <input id="audio-input" type="file" accept="audio/*">
-      <button id="transcribe-btn" class="ghost" type="button" onclick="transcribeAudio()">오디오 전사</button>
     </div>
-    <div class="controls">
-      <button id="submit-btn" type="button" onclick="submitTypedAnswer()">답변 제출</button>
-      <button id="skip-btn" class="secondary" type="button" onclick="skipCurrentStep()">현재 질문 건너뛰기</button>
-      <button id="end-btn" class="danger" type="button" onclick="endInterview()">인터뷰 종료</button>
-    </div>
-  </section>
-</main>
+  </form>
+  <p class="muted">음성으로 진행하려면 <a class="voice-link" id="voice-link" href="#">음성 인터뷰 화면</a>으로 이동하세요. 음성 transport가 실패해도 이 단계형 화면에서 평가를 이어갈 수 있습니다.</p>
+</div>
+
 <div id="report-view"></div>
+
 <script>
 const parts = location.pathname.split('/');
 const EVAL_ID = parts[2];
 const SESSION_ID = parts[3];
 const API_BASE = `/api/project-evaluations/${EVAL_ID}/sessions/${SESSION_ID}/interview`;
-let mode = 'answer';
+document.getElementById('voice-link').href = `/interview/${EVAL_ID}/${SESSION_ID}/voice`;
+
+let currentMode = 'answer';
+let currentQuestionId = null;
 let draftAnswer = '';
 let followUpQuestion = '';
 let followUpReason = '';
-let currentQuestion = null;
-let currentQuestionIndex = 0;
 let totalQuestions = 0;
-let retryAction = null;
 
-function hideError() {
-  document.getElementById('error-card').hidden = true;
-  document.getElementById('error-message').textContent = '';
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
-function showError(message, retry = null) {
-  document.getElementById('error-card').hidden = false;
-  document.getElementById('error-message').textContent = message;
-  retryAction = retry;
-  document.getElementById('retry-btn').disabled = !retry;
-}
-
-function retryCurrentAction() {
-  if (retryAction) retryAction();
-}
-
-function setStatus(state, text) {
-  document.getElementById('status-dot').className = state;
-  document.getElementById('status-text').textContent = text;
-  if (state !== 'error') hideError();
-}
-
-function esc(value) {
-  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, { credentials: 'same-origin', ...options });
-  const contentType = response.headers.get('content-type') || '';
-  const body = contentType.includes('application/json') ? await response.json() : await response.text();
-  if (!response.ok) {
-    const detail = body && body.detail ? body.detail : body;
-    const message = typeof detail === 'object' ? detail.message || JSON.stringify(detail) : String(detail);
-    throw new Error(message || `요청 실패 (${response.status})`);
+function showError(text) {
+  const node = document.getElementById('error');
+  if (!text) {
+    node.classList.remove('show');
+    node.textContent = '';
+    return;
   }
-  return body;
+  node.classList.add('show');
+  node.textContent = text;
 }
 
-async function loadState() {
-  setStatus('busy', '인터뷰 상태를 불러오는 중...');
+function showInfo(text) {
+  const node = document.getElementById('info');
+  if (!text) {
+    node.classList.remove('show');
+    node.textContent = '';
+    return;
+  }
+  node.classList.add('show');
+  node.textContent = text;
+}
+
+function setProgress(text) {
+  document.getElementById('progress').innerHTML = text;
+}
+
+function renderQuestion(question, total, index) {
+  if (!question) {
+    document.getElementById('question-card').style.display = 'none';
+    return;
+  }
+  document.getElementById('question-card').style.display = 'block';
+  document.getElementById('question-label').textContent = `질문 ${index + 1} / ${total}`;
+  document.getElementById('question-text').textContent = question.question || '';
+  currentQuestionId = question.id || null;
+}
+
+function renderFollowUp(text) {
+  const card = document.getElementById('follow-up-card');
+  if (!text) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+  document.getElementById('follow-up-text').textContent = text;
+}
+
+function renderDraft(text) {
+  const node = document.getElementById('draft');
+  if (!text) {
+    node.style.display = 'none';
+    node.textContent = '';
+    return;
+  }
+  node.style.display = 'block';
+  node.textContent = `직전까지 누적된 답변: ${text}`;
+}
+
+async function api(method, path, body) {
+  const init = {
+    method,
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+  };
+  if (body !== undefined) {
+    init.body = JSON.stringify(body);
+  }
+  const res = await fetch(`${API_BASE}${path}`, init);
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const errPayload = await res.json();
+      detail = typeof errPayload.detail === 'string'
+        ? errPayload.detail
+        : JSON.stringify(errPayload.detail || errPayload);
+    } catch (_e) {
+      detail = await res.text();
+    }
+    throw new Error(detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+async function refreshState() {
+  showError('');
   try {
-    const state = await fetchJson(`${API_BASE}/state`);
-    renderTurns(state.turns || []);
+    const state = await api('GET', '/state');
+    totalQuestions = state.total_questions || 0;
     if (state.is_completed) {
-      currentQuestion = null;
-      await completeInterview();
+      try {
+        const report = await api('POST', '/complete', undefined);
+        renderReport(report);
+      } catch (_e) {
+        setProgress('인터뷰가 완료되었습니다.');
+      }
       return;
     }
-    if (!state.question) {
-      currentQuestion = null;
-      setStatus('ready', '인터뷰가 완료되었거나 답변할 질문이 없습니다.');
-      disableInputs(true);
-      return;
-    }
-    currentQuestion = state.question;
-    currentQuestionIndex = state.current_question_index;
-    totalQuestions = state.total_questions;
-    mode = 'answer';
+    setProgress(`<strong>${state.current_question_index + 1}</strong> / ${state.total_questions} 질문 진행 중`);
+    renderQuestion(state.question, state.total_questions, state.current_question_index);
+    renderFollowUp('');
+    renderDraft('');
+    currentMode = 'answer';
     draftAnswer = '';
     followUpQuestion = '';
     followUpReason = '';
-    renderQuestion(currentQuestionIndex, totalQuestions, state.question);
-    renderModePrompt('현재 질문에 답변해 주세요.');
-    setStatus('ready', '답변 입력 대기 중');
-  } catch (error) {
-    setStatus('error', error.message);
-    showError(error.message, loadState);
+  } catch (err) {
+    showError(err.message);
   }
 }
 
-function renderTurns(turns) {
-  const history = document.getElementById('turn-history');
-  if (!turns.length) {
-    history.innerHTML = '';
-    return;
-  }
-  history.innerHTML = turns.map((turn, index) => `
-    <article class="turn">
-      <strong>완료된 질문 ${index + 1}. ${esc(turn.question_text)}</strong>
-      <p>${esc(turn.answer_text)}</p>
-    </article>
-  `).join('');
+async function submitAnswer(text, modeOverride) {
+  const mode = modeOverride || currentMode;
+  const payload = {
+    mode,
+    answer_text: text,
+    draft_answer: draftAnswer,
+    follow_up_question: followUpQuestion,
+    follow_up_reason: followUpReason,
+    current_question_id: currentQuestionId,
+  };
+  return api('POST', '/answer', payload);
 }
 
-function renderQuestion(index, total, question) {
-  document.getElementById('question-area').innerHTML = `
-    <div class="progress">질문 ${index + 1} / ${total}</div>
-    <article class="question-card">
-      <h2>${esc(question.question)}</h2>
-      <div class="question-meta">Bloom: ${esc(question.bloom_level)} · 의도: ${esc(question.intent)}</div>
-    </article>
-  `;
-}
+function applyFlowResponse(response) {
+  draftAnswer = response.draft_answer || '';
+  followUpQuestion = response.follow_up_question || '';
+  followUpReason = response.follow_up_reason || '';
 
-function renderModePrompt(text) {
-  const prompt = document.getElementById('mode-prompt');
-  prompt.textContent = text;
-  prompt.style.display = text ? 'block' : 'none';
-}
-
-function disableInputs(disabled) {
-  ['answer-input', 'audio-input', 'transcribe-btn', 'submit-btn', 'skip-btn', 'end-btn'].forEach((id) => {
-    document.getElementById(id).disabled = disabled;
-  });
-}
-
-async function submitTypedAnswer() {
-  const answer = document.getElementById('answer-input').value.trim();
-  if (!answer) {
-    setStatus('error', '답변을 입력하세요.');
-    return;
-  }
-  await submitAnswer(answer);
-}
-
-async function skipCurrentStep() {
-  await submitAnswer(mode === 'follow_up' ? '그 부분은 넘어가겠습니다.' : '이 질문은 넘어가겠습니다.');
-}
-
-async function endInterview() {
-  await submitAnswer('이제 인터뷰를 끝내겠습니다.', 'end');
-}
-
-async function submitAnswer(answerText, modeOverride = null) {
-  if (!currentQuestion) return;
-  disableInputs(true);
-  setStatus('busy', '답변을 처리하는 중...');
-  try {
-    const response = await fetchJson(`${API_BASE}/answer`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        mode: modeOverride || mode,
-        answer_text: answerText,
-        draft_answer: draftAnswer,
-        follow_up_question: followUpQuestion,
-        follow_up_reason: followUpReason,
-        current_question_id: currentQuestion.id,
-      }),
-    });
-    handleTurnResponse(response);
-  } catch (error) {
-    setStatus('error', error.message);
-    showError(error.message, () => submitAnswer(answerText, modeOverride));
-  } finally {
-    if (document.getElementById('report-view').style.display !== 'flex') disableInputs(false);
-  }
-}
-
-function handleTurnResponse(response) {
-  if (response.status === 'need_follow_up') {
-    mode = 'follow_up';
-    draftAnswer = response.draft_answer || '';
-    followUpQuestion = response.follow_up_question || '';
-    followUpReason = response.follow_up_reason || '';
-    document.getElementById('answer-input').value = '';
-    renderModePrompt(`꼬리질문: ${followUpQuestion}`);
-    setStatus('ready', '꼬리질문 답변 대기 중');
-    return;
-  }
   if (response.status === 'need_more') {
-    mode = 'more';
-    draftAnswer = response.draft_answer || '';
-    followUpQuestion = '';
-    followUpReason = '';
-    document.getElementById('answer-input').value = '';
-    renderModePrompt(response.message || '추가로 말씀하실 내용이 있으실까요?');
-    setStatus('ready', '추가 답변 대기 중');
+    currentMode = 'more';
+    renderDraft(draftAnswer);
+    renderFollowUp('');
+    showInfo(response.message || '추가로 말씀하실 내용이 있으시면 입력하세요. 없다면 "없습니다"라고 적어주세요.');
+    document.getElementById('answer').value = '';
+    document.getElementById('answer').focus();
     return;
   }
-  if (response.status === 'completed') {
-    renderReport(response.report);
+  if (response.status === 'need_follow_up') {
+    currentMode = 'follow_up';
+    renderDraft(draftAnswer);
+    renderFollowUp(followUpQuestion);
+    showInfo(response.message || '꼬리질문에 답변해 주세요.');
+    document.getElementById('answer').value = '';
+    document.getElementById('answer').focus();
     return;
   }
-  if (response.turn) appendTurn(response.turn);
-  mode = 'answer';
+
   draftAnswer = '';
   followUpQuestion = '';
   followUpReason = '';
-  document.getElementById('answer-input').value = '';
-  if (response.next_question) {
-    currentQuestion = response.next_question;
-    currentQuestionIndex = response.next_question.order_index;
-    renderQuestion(currentQuestionIndex, totalQuestions, response.next_question);
-    renderModePrompt('다음 질문에 답변해 주세요.');
-    setStatus('ready', '다음 답변 입력 대기 중');
-    loadState();
+
+  if (response.status === 'turn_submitted') {
+    currentMode = 'answer';
+    showInfo(response.message || '');
+    refreshState();
     return;
   }
-  currentQuestion = null;
-  completeInterview();
+
+  if (response.status === 'ready_to_complete' || response.status === 'completed') {
+    if (response.report) {
+      renderReport(response.report);
+      return;
+    }
+    finalizeAndRender();
+  }
 }
 
-function appendTurn(turn) {
-  const history = document.getElementById('turn-history');
-  history.insertAdjacentHTML('beforeend', `
-    <article class="turn">
-      <strong>${esc(turn.question_text)}</strong>
-      <p>${esc(turn.answer_text)}</p>
-    </article>
-  `);
-}
-
-async function completeInterview() {
-  disableInputs(true);
-  setStatus('busy', '최종 리포트를 생성하는 중...');
+async function finalizeAndRender() {
   try {
-    const report = await fetchJson(`${API_BASE}/complete`, { method: 'POST' });
+    const report = await api('POST', '/complete', undefined);
     renderReport(report);
-  } catch (error) {
-    setStatus('error', error.message);
-    showError(error.message, completeInterview);
-    disableInputs(false);
+  } catch (err) {
+    showError(err.message);
   }
 }
 
-async function transcribeAudio() {
-  const input = document.getElementById('audio-input');
-  if (!input.files || !input.files[0]) {
-    setStatus('error', '전사할 오디오 파일을 선택하세요.');
-    showError('전사할 오디오 파일을 선택하세요.');
-    return;
-  }
-  disableInputs(true);
-  setStatus('busy', '오디오를 전사하는 중...');
-  try {
-    const form = new FormData();
-    form.append('mode', mode);
-    form.append('audio', input.files[0]);
-    const result = await fetchJson(`${API_BASE}/transcribe`, { method: 'POST', body: form });
-    const textarea = document.getElementById('answer-input');
-    textarea.value = [textarea.value.trim(), result.transcript].filter(Boolean).join('\n');
-    setStatus('ready', '전사 결과를 답변에 추가했습니다.');
-  } catch (error) {
-    setStatus('error', error.message);
-    showError(error.message, transcribeAudio);
-  } finally {
-    disableInputs(false);
-  }
-}
-
-function vClass(value) {
-  if (value === '검증 통과') return 'pass';
-  if (value === '신뢰 낮음') return 'fail';
+function vClass(v) {
+  if (v === '검증 통과') return 'pass';
+  if (v === '신뢰 낮음') return 'fail';
   return 'caution';
 }
 
-function listHtml(items) {
-  if (!items || !items.length) return '<p>없음</p>';
-  return `<ul>${items.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>`;
+function tag(v) {
+  return `<span class="tag ${vClass(v)}">${esc(v)}</span>`;
+}
+
+function listHtml(arr) {
+  if (!arr || !arr.length) return '<p class="muted">없음</p>';
+  return '<ul class="bullet">' + arr.map((s) => `<li>${esc(String(s))}</li>`).join('') + '</ul>';
 }
 
 function renderReport(report) {
-  disableInputs(true);
   document.getElementById('main').style.display = 'none';
-  const reportView = document.getElementById('report-view');
-  if (!report) {
-    reportView.innerHTML = '<section class="section"><h3>리포트 없음</h3><p>리포트 응답을 받지 못했습니다.</p></section>';
-  } else {
-    const verdictClass = vClass(report.final_decision);
-    reportView.innerHTML = `
-      <section class="report-header">
-        <div class="verdict ${verdictClass}">${esc(report.final_decision)}</div>
-        <div class="score-badge">신뢰도 점수: ${esc(Number(report.authenticity_score).toFixed(1))}</div>
-      </section>
-      <section class="section"><h3>인터뷰 요약</h3><p>${esc(report.summary || '')}</p></section>
-      <div class="grid2">
-        <section class="section"><h3>강점</h3>${listHtml(report.strengths)}</section>
-        <section class="section"><h3>의심 지점</h3>${listHtml(report.suspicious_points)}</section>
-        <section class="section"><h3>근거 일치</h3>${listHtml(report.evidence_alignment)}</section>
-        <section class="section"><h3>추가 확인 질문</h3>${listHtml(report.recommended_followups)}</section>
-      </div>
-    `;
+  const view = document.getElementById('report-view');
+  const score = typeof report.authenticity_score === 'number'
+    ? report.authenticity_score.toFixed(1)
+    : report.authenticity_score;
+  const verdictClass = vClass(report.final_decision);
+  let html = `<div class="report-header"><div class="verdict ${verdictClass}">${esc(report.final_decision)}</div>`
+    + `<div class="score-badge">신뢰도 점수 : ${esc(score)}</div></div>`
+    + `<div class="section"><h3>인터뷰 요약</h3><p>${esc(report.summary || '')}</p></div>`;
+
+  if (report.area_analyses && report.area_analyses.length) {
+    html += '<div class="section"><h3>프로젝트 영역별 신뢰도</h3>'
+      + '<table><thead><tr><th>영역</th><th>판정</th><th>점수</th><th>근거</th></tr></thead><tbody>';
+    report.area_analyses.forEach((area) => {
+      html += `<tr><td>${esc(area.area_name || '')}</td><td>${tag(area.decision || '')}</td>`
+        + `<td>${esc(typeof area.score === 'number' ? area.score.toFixed(1) : area.score)}</td>`
+        + `<td style="font-size:.8rem">${esc(area.summary || '')}</td></tr>`;
+    });
+    html += '</tbody></table></div>';
   }
-  reportView.style.display = 'flex';
-  reportView.scrollIntoView({ behavior: 'smooth' });
+
+  if (report.question_evaluations && report.question_evaluations.length) {
+    html += '<div class="section"><h3>질문별 평가</h3>'
+      + '<table><thead><tr><th>#</th><th>질문</th><th>점수</th><th>Bloom</th></tr></thead><tbody>';
+    report.question_evaluations.forEach((q) => {
+      html += `<tr><td>${esc(q.order_index != null ? q.order_index + 1 : '')}</td>`
+        + `<td style="font-size:.8rem">${esc(q.question || '')}</td>`
+        + `<td>${esc(typeof q.score === 'number' ? q.score.toFixed(1) : q.score)}</td>`
+        + `<td>${esc(q.bloom_level || '')}</td></tr>`;
+    });
+    html += '</tbody></table></div>';
+  }
+
+  html += `<div class="section"><h3>강점</h3>${listHtml(report.strengths)}</div>`
+    + `<div class="section"><h3>의심 지점</h3>${listHtml(report.suspicious_points)}</div>`
+    + `<div class="section"><h3>근거 일치</h3>${listHtml(report.evidence_alignment)}</div>`
+    + `<div class="section"><h3>추가 확인 질문</h3>${listHtml(report.recommended_followups)}</div>`;
+
+  view.innerHTML = html;
+  view.style.display = 'flex';
+  view.scrollIntoView({ behavior: 'smooth' });
 }
 
-loadState();
+document.getElementById('answer-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  showError('');
+  const textarea = document.getElementById('answer');
+  const text = textarea.value.trim();
+  if (!text) {
+    showError('답변을 입력하세요.');
+    return;
+  }
+  const submitBtn = document.getElementById('submit-btn');
+  submitBtn.disabled = true;
+  try {
+    const response = await submitAnswer(text);
+    applyFlowResponse(response);
+  } catch (err) {
+    showError(err.message);
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+
+document.getElementById('end-btn').addEventListener('click', async () => {
+  if (!confirm('인터뷰를 종료하시겠습니까? 남은 질문은 미응답으로 처리됩니다.')) {
+    return;
+  }
+  showError('');
+  try {
+    const response = await submitAnswer(' ', 'end');
+    applyFlowResponse(response);
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+refreshState();
 </script>
 </body>
 </html>
 """
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+_VOICE_HTML = '''
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>음성 보조 인터뷰</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 24px 16px; }
+h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; margin-bottom: 4px; }
+.subtitle { font-size: .85rem; color: #64748b; margin-bottom: 24px; }
+#main { width: 100%; max-width: 800px; display: flex; flex-direction: column; gap: 16px; }
+#status-bar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: #1e293b; border-radius: 10px; }
+#status-dot { width: 12px; height: 12px; border-radius: 50%; background: #64748b; flex-shrink: 0; transition: background .3s; }
+#status-dot.connecting { background: #fbbf24; animation: pulse 1s infinite; }
+#status-dot.ai-speaking { background: #34d399; animation: pulse .6s infinite; }
+#status-dot.user-speaking { background: #f87171; animation: pulse .4s infinite; }
+#status-dot.ready { background: #34d399; }
+#status-dot.evaluating { background: #a78bfa; animation: pulse 1s infinite; }
+#status-dot.error { background: #ef4444; }
+#status-text { font-size: .9rem; color: #94a3b8; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+#transcript { background: #1e293b; border-radius: 12px; padding: 16px; min-height: 300px; max-height: 450px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+.msg { display: flex; flex-direction: column; gap: 4px; }
+.msg-label { font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+.msg.ai .msg-label { color: #7dd3fc; }
+.msg.user .msg-label { color: #86efac; }
+.msg.system .msg-label { color: #a78bfa; }
+.msg-text { font-size: .95rem; line-height: 1.6; padding: 10px 14px; border-radius: 8px; }
+.msg.ai .msg-text { background: #1a3a5e; color: #e2e8f0; }
+.msg.user .msg-text { background: #14532d; color: #e2e8f0; margin-left: 24px; }
+.msg.system .msg-text { background: #2d1f69; color: #c4b5fd; font-style: italic; font-size: .85rem; }
+#live-caption { display: none; flex-direction: column; gap: 4px; }
+#live-caption .msg-label { color: #7dd3fc; font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+#live-caption-text { font-size: .95rem; line-height: 1.6; padding: 10px 14px; border-radius: 8px; background: #1a3a5e; color: #e2e8f0; min-height: 48px; }
+#controls { display: flex; gap: 12px; justify-content: space-between; flex-wrap: wrap; align-items: center; }
+#controls .right { display: flex; gap: 12px; }
+#end-btn { padding: 10px 24px; background: #dc2626; color: #fff; border: none; border-radius: 8px; font-size: .9rem; font-weight: 600; cursor: pointer; transition: background .2s; }
+#end-btn:hover { background: #b91c1c; }
+#end-btn:disabled { background: #374151; cursor: default; color: #6b7280; }
+.info-bar { padding: 10px 16px; background: #1e3a5f; border-radius: 8px; font-size: .85rem; color: #93c5fd; display: none; }
+#report-view { width: 100%; max-width: 800px; display: none; flex-direction: column; gap: 20px; }
+.report-header { padding: 24px; background: #1e293b; border-radius: 14px; text-align: center; }
+.verdict { font-size: 1.8rem; font-weight: 800; margin-bottom: 8px; }
+.verdict.pass { color: #34d399; }
+.verdict.caution { color: #fbbf24; }
+.verdict.fail { color: #f87171; }
+.score-badge { display: inline-block; padding: 4px 16px; border-radius: 20px; font-size: .95rem; font-weight: 600; background: #0f172a; color: #94a3b8; }
+.section { background: #1e293b; border-radius: 12px; padding: 20px; }
+.section h3 { font-size: 1rem; font-weight: 700; color: #7dd3fc; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #1e3a5f; }
+.section p { font-size: .9rem; line-height: 1.7; color: #cbd5e1; }
+table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+th { text-align: left; padding: 8px 10px; background: #0f172a; color: #94a3b8; font-weight: 600; }
+td { padding: 8px 10px; border-top: 1px solid #1e3a5f; color: #cbd5e1; vertical-align: top; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: .75rem; font-weight: 600; }
+.tag.pass { background: #14532d; color: #86efac; }
+.tag.caution { background: #451a03; color: #fbbf24; }
+.tag.fail { background: #450a0a; color: #f87171; }
+ul.bullet { padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+ul.bullet li { font-size: .88rem; color: #cbd5e1; line-height: 1.5; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media(max-width: 600px) { .grid2 { grid-template-columns: 1fr; } }
+.notice { font-size: .82rem; color: #94a3b8; }
+.notice a { color: #7dd3fc; }
+</style>
+</head>
+<body>
+<h1>음성 보조 인터뷰</h1>
+<p class="subtitle">평가 진행과 결정은 텍스트 단계형 core가 담당하고, 이 화면은 음성 입출력 보조 역할입니다. 음성 transport가 실패하면 <a href="#" id="staged-link">단계형 화면</a>에서 그대로 이어 갈 수 있습니다.</p>
+
+<div id="main">
+  <div id="status-bar">
+    <div id="status-dot" class="connecting"></div>
+    <span id="status-text">실시간 인터뷰를 연결하는 중...</span>
+  </div>
+  <div id="info-bar" class="info-bar"></div>
+  <div id="transcript">
+    <div class="msg system"><span class="msg-label">시스템</span><span class="msg-text">연결하는 중입니다. 잠시 기다려 주세요...</span></div>
+  </div>
+  <div id="live-caption">
+    <span class="msg-label">인터뷰어</span>
+    <div id="live-caption-text"></div>
+  </div>
+  <div id="controls">
+    <a class="notice" href="#" id="back-link">← 단계형 화면으로 돌아가기</a>
+    <div class="right">
+      <button id="end-btn" disabled>인터뷰 종료</button>
+    </div>
+  </div>
+</div>
+
+<div id="report-view"></div>
+
+<script>
+const parts = location.pathname.split('/');
+const EVAL_ID = parts[2];
+const SESSION_ID = parts[3];
+const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/project-evaluations/ws/interview/${EVAL_ID}/${SESSION_ID}`;
+const STAGED_URL = `/interview/${EVAL_ID}/${SESSION_ID}`;
+document.getElementById('staged-link').href = STAGED_URL;
+document.getElementById('back-link').href = STAGED_URL;
+
+let audioContext = null;
+let mediaStream = null;
+let mediaSource = null;
+let processor = null;
+let socket = null;
+let isRenderingReport = false;
+let captureEnabled = false;
+let playheadTime = 0;
+let currentAiText = '';
+let bootstrapDone = false;
+
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function setStatus(state, text) {
+  document.getElementById('status-dot').className = state;
+  document.getElementById('status-text').textContent = text;
+}
+
+function showInfo(text) {
+  const bar = document.getElementById('info-bar');
+  if (!text) {
+    bar.style.display = 'none';
+    bar.textContent = '';
+    return;
+  }
+  bar.textContent = text;
+  bar.style.display = 'block';
+}
+
+function addMsg(cls, label, text) {
+  const transcript = document.getElementById('transcript');
+  if (!bootstrapDone) {
+    transcript.innerHTML = '';
+    bootstrapDone = true;
+  }
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  div.innerHTML = '<span class="msg-label">' + esc(label) + '</span>'
+    + '<span class="msg-text">' + esc(text) + '</span>';
+  transcript.appendChild(div);
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+function setLiveCaption(text) {
+  const container = document.getElementById('live-caption');
+  const textEl = document.getElementById('live-caption-text');
+  if (!text) {
+    currentAiText = '';
+    container.style.display = 'none';
+    textEl.textContent = '';
+    return;
+  }
+  currentAiText = text;
+  container.style.display = 'flex';
+  textEl.textContent = text;
+}
+
+function finalizeAiCaption() {
+  if (!currentAiText) {
+    return;
+  }
+  addMsg('ai', '인터뷰어', currentAiText);
+  setLiveCaption('');
+}
+
+function vClass(v) {
+  if (v === '검증 통과') return 'pass';
+  if (v === '신뢰 낮음') return 'fail';
+  return 'caution';
+}
+
+function tag(v) {
+  return '<span class="tag ' + vClass(v) + '">' + esc(v) + '</span>';
+}
+
+function listHtml(arr) {
+  if (!arr || !arr.length) return '<p style="color:#64748b;font-size:.85rem">없음</p>';
+  return '<ul class="bullet">' + arr.map(function(s) {
+    return '<li>' + esc(String(s)) + '</li>';
+  }).join('') + '</ul>';
+}
+
+async function renderReport(report) {
+  isRenderingReport = true;
+  document.getElementById('end-btn').disabled = true;
+  captureEnabled = false;
+  document.getElementById('main').style.display = 'none';
+  const score = typeof report.authenticity_score === 'number'
+    ? report.authenticity_score.toFixed(1)
+    : report.authenticity_score;
+  const verdictClass = vClass(report.final_decision);
+
+  let html = '<div class="report-header">'
+    + '<div class="verdict ' + verdictClass + '">' + esc(report.final_decision) + '</div>'
+    + '<div class="score-badge">신뢰도 점수 : ' + esc(score) + '</div>'
+    + '</div>'
+    + '<div class="section"><h3>인터뷰 요약</h3><p>' + esc(report.summary || '') + '</p></div>';
+
+  if (report.area_analyses && report.area_analyses.length) {
+    html += '<div class="section"><h3>프로젝트 영역별 신뢰도</h3>'
+      + '<table><thead><tr><th>영역</th><th>판정</th><th>점수</th><th>근거</th></tr></thead><tbody>';
+    report.area_analyses.forEach(function(area) {
+      html += '<tr><td>' + esc(area.area_name || '') + '</td><td>' + tag(area.decision || '') + '</td>'
+        + '<td>' + esc(typeof area.score === 'number' ? area.score.toFixed(1) : area.score) + '</td>'
+        + '<td style="font-size:.8rem">' + esc(area.summary || '') + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+
+  if (report.question_evaluations && report.question_evaluations.length) {
+    html += '<div class="section"><h3>질문별 평가</h3>'
+      + '<table><thead><tr><th>#</th><th>질문</th><th>점수</th><th>Bloom</th></tr></thead><tbody>';
+    report.question_evaluations.forEach(function(question) {
+      html += '<tr><td>' + esc(question.order_index != null ? question.order_index + 1 : '') + '</td>'
+        + '<td style="font-size:.8rem">' + esc(question.question || '') + '</td>'
+        + '<td>' + esc(typeof question.score === 'number' ? question.score.toFixed(1) : question.score) + '</td>'
+        + '<td>' + esc(question.bloom_level || '') + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+
+  html += '<div class="grid2">'
+    + '<div class="section"><h3>강점</h3>' + listHtml(report.strengths) + '</div>'
+    + '<div class="section"><h3>의심 지점</h3>' + listHtml(report.suspicious_points) + '</div>'
+    + '<div class="section"><h3>근거 일치</h3>' + listHtml(report.evidence_alignment) + '</div>'
+    + '<div class="section"><h3>추가 확인 질문</h3>' + listHtml(report.recommended_followups) + '</div>'
+    + '</div>';
+
+  const view = document.getElementById('report-view');
+  view.innerHTML = html;
+  view.style.display = 'flex';
+  view.scrollIntoView({ behavior: 'smooth' });
+}
+
+function downsampleBuffer(input, inputRate, outputRate) {
+  if (inputRate === outputRate) {
+    return input;
+  }
+  const ratio = inputRate / outputRate;
+  const newLength = Math.round(input.length / ratio);
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < input.length; i += 1) {
+      accum += input[i];
+      count += 1;
+    }
+    result[offsetResult] = count ? accum / count : 0;
+    offsetResult += 1;
+    offsetBuffer = nextOffsetBuffer;
+  }
+  return result;
+}
+
+function floatTo16BitPCM(input) {
+  const buffer = new ArrayBuffer(input.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < input.length; i += 1) {
+    let sample = Math.max(-1, Math.min(1, input[i]));
+    sample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    view.setInt16(i * 2, sample, true);
+  }
+  return buffer;
+}
+
+function int16ToFloat32(arrayBuffer) {
+  const view = new DataView(arrayBuffer);
+  const float32 = new Float32Array(arrayBuffer.byteLength / 2);
+  for (let i = 0; i < float32.length; i += 1) {
+    float32[i] = view.getInt16(i * 2, true) / 0x8000;
+  }
+  return float32;
+}
+
+function playPcm16(arrayBuffer) {
+  if (!audioContext) {
+    return;
+  }
+  const float32 = int16ToFloat32(arrayBuffer);
+  const audioBuffer = audioContext.createBuffer(1, float32.length, 24000);
+  audioBuffer.copyToChannel(float32, 0);
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+  const now = audioContext.currentTime;
+  playheadTime = Math.max(playheadTime, now + 0.02);
+  source.start(playheadTime);
+  playheadTime += audioBuffer.duration;
+}
+
+async function setupAudio() {
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  await audioContext.resume();
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      noiseSuppression: true,
+      echoCancellation: true,
+      autoGainControl: true,
+    },
+  });
+  mediaSource = audioContext.createMediaStreamSource(mediaStream);
+  processor = audioContext.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (event) => {
+    if (!captureEnabled || !socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const input = event.inputBuffer.getChannelData(0);
+    const downsampled = downsampleBuffer(input, audioContext.sampleRate, 24000);
+    const pcm = floatTo16BitPCM(downsampled);
+    socket.send(pcm);
+  };
+  mediaSource.connect(processor);
+  processor.connect(audioContext.destination);
+}
+
+function closeSocket() {
+  if (socket && socket.readyState <= WebSocket.OPEN) {
+    socket.close();
+  }
+}
+
+function cleanupAudio() {
+  captureEnabled = false;
+  closeSocket();
+  mediaStream?.getTracks?.().forEach((track) => track.stop());
+  processor?.disconnect?.();
+  mediaSource?.disconnect?.();
+  audioContext?.close?.();
+}
+
+function endInterview() {
+  if (!socket || socket.readyState !== WebSocket.OPEN || isRenderingReport) {
+    return;
+  }
+  document.getElementById('end-btn').disabled = true;
+  setStatus('evaluating', '인터뷰 종료 중...');
+  socket.send(JSON.stringify({ type: 'interview.end' }));
+}
+
+function connectSocket() {
+  return new Promise((resolve, reject) => {
+    socket = new WebSocket(WS_URL);
+    socket.binaryType = 'arraybuffer';
+
+    socket.onopen = () => {
+      document.getElementById('end-btn').disabled = false;
+      setStatus('ready', '실시간 인터뷰 연결 완료');
+      resolve();
+    };
+
+    socket.onmessage = async (event) => {
+      if (typeof event.data !== 'string') {
+        playPcm16(event.data);
+        return;
+      }
+      const message = JSON.parse(event.data);
+      if (message.type === 'prompt.queued') {
+        setLiveCaption(message.text || '');
+        setStatus('ai-speaking', '인터뷰어가 말하는 중...');
+        return;
+      }
+      if (message.type === 'response.audio.done') {
+        finalizeAiCaption();
+        return;
+      }
+      if (message.type === 'input.open') {
+        captureEnabled = true;
+        if (message.mode === 'identity') {
+          showInfo('본인 확인 답변을 말씀해 주세요.');
+          setStatus('ready', '학번과 이름을 말씀해 주세요');
+        } else if (message.mode === 'follow_up') {
+          showInfo('꼬리질문에 답변해 주세요.');
+          setStatus('ready', '꼬리질문에 답변해 주세요');
+        } else if (message.mode === 'more') {
+          showInfo('추가 답변을 말씀해 주세요.');
+          setStatus('ready', '추가 답변을 말씀해 주세요');
+        } else {
+          showInfo('답변을 말씀해 주세요.');
+          setStatus('ready', '답변을 말씀해 주세요');
+        }
+        return;
+      }
+      if (message.type === 'transcript.user') {
+        addMsg('user', '지원자', message.text || '');
+        return;
+      }
+      if (message.type === 'vad.speech_started') {
+        setStatus('user-speaking', '답변을 듣는 중...');
+        return;
+      }
+      if (message.type === 'vad.speech_stopped') {
+        setStatus('evaluating', '답변을 처리 중...');
+        return;
+      }
+      if (message.type === 'info') {
+        addMsg('system', '시스템', message.message || '');
+        return;
+      }
+      if (message.type === 'transcription.failed') {
+        addMsg('system', '시스템', message.message || '음성 전사에 실패했습니다.');
+        setStatus('ready', '다시 말씀해 주세요');
+        return;
+      }
+      if (message.type === 'interview.complete') {
+        await renderReport(message.report);
+        return;
+      }
+      if (message.type === 'error') {
+        captureEnabled = false;
+        addMsg('system', '오류', message.message || '실시간 인터뷰 처리 중 오류가 발생했습니다.');
+        setStatus('error', '오류 발생');
+        document.getElementById('end-btn').disabled = true;
+        return;
+      }
+    };
+
+    socket.onerror = () => {
+      reject(new Error('실시간 인터뷰 WebSocket 연결에 실패했습니다.'));
+    };
+
+    socket.onclose = () => {
+      captureEnabled = false;
+      if (!isRenderingReport) {
+        document.getElementById('end-btn').disabled = true;
+      }
+    };
+  });
+}
+
+async function bootstrap() {
+  setStatus('connecting', '실시간 인터뷰를 준비하는 중...');
+  document.getElementById('end-btn').addEventListener('click', endInterview);
+  try {
+    await setupAudio();
+    await connectSocket();
+    showInfo('마이크가 연결되었습니다. 인터뷰어의 안내를 기다려 주세요.');
+  } catch (error) {
+    cleanupAudio();
+    addMsg('system', '오류', error.message || String(error));
+    setStatus('error', '음성 보조 시작 실패. 단계형 화면에서 계속 진행하세요.');
+    document.getElementById('end-btn').disabled = true;
+  }
+}
+
+window.addEventListener('beforeunload', () => {
+  cleanupAudio();
+});
+
+bootstrap();
+</script>
+</body>
+</html>
+'''
+
+# 외부 import 호환용 (테스트 등이 음성 보조 HTML을 검사할 때 사용한다)
+_HTML = _VOICE_HTML
 
 
 @router.get("/interview/{evaluation_id}/{session_id}/open", response_class=HTMLResponse)
@@ -537,6 +927,10 @@ async def set_interview_cookie(
 
 
 @router.get("/interview/{evaluation_id}/{session_id}", response_class=HTMLResponse)
-async def get_interview_page(evaluation_id: str, session_id: str) -> str:
-    return _HTML
+async def get_staged_interview_page(evaluation_id: str, session_id: str) -> str:
+    return _STAGED_HTML
 
+
+@router.get("/interview/{evaluation_id}/{session_id}/voice", response_class=HTMLResponse)
+async def get_voice_interview_page(evaluation_id: str, session_id: str) -> str:
+    return _VOICE_HTML
