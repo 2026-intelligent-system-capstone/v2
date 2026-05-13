@@ -243,6 +243,18 @@ def complete_session(
     )
 
 
+def list_turns(
+    evaluation_id: str,
+    session_id: str,
+    session_token: str = "",
+) -> list[dict[str, object]]:
+    return request_json_list(
+        "GET",
+        f"/api/project-evaluations/{evaluation_id}/sessions/{session_id}/turns",
+        headers={"X-Session-Token": session_token},
+    )
+
+
 def get_latest_report(evaluation_id: str, admin_password: str = "") -> dict[str, object]:
     return request_json_dict(
         "GET",
