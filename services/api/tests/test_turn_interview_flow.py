@@ -9,6 +9,9 @@ from sqlalchemy.exc import IntegrityError
 from services.api.app.main import app
 from services.api.app.project_evaluations.analysis.prompts import (
     AnswerEvalSchema,
+    FinalizeAnswerSchema,
+    FollowUpQuestionSchema,
+    JudgeAnswerSchema,
     ReportSchema,
     RubricScoreSchema,
 )
@@ -49,6 +52,45 @@ class FakeInterviewLlm:
 
     def parse(self, messages, schema, max_tokens):
         self.parse_calls.append(schema)
+        if schema is JudgeAnswerSchema:
+            needs_follow_up = bool(self.follow_up_question)
+            return JudgeAnswerSchema(
+                needs_follow_up=needs_follow_up,
+                reason=(
+                    "추가 확인이 필요합니다."
+                    if needs_follow_up
+                    else "현재 답변만으로 평가가 가능합니다."
+                ),
+                request_to_generator=(
+                    "더 구체적인 구현 근거를 확인하는 꼬리질문이 필요합니다."
+                    if needs_follow_up
+                    else ""
+                ),
+            )
+        if schema is FollowUpQuestionSchema:
+            return FollowUpQuestionSchema(
+                follow_up_question=self.follow_up_question or "추가 확인이 필요한 질문입니다.",
+            )
+        if schema is FinalizeAnswerSchema:
+            return FinalizeAnswerSchema(
+                score=80.0,
+                evaluation_summary="제출 자료와 일치하는 답변입니다.",
+                rubric_scores=[
+                    RubricScoreSchema(
+                        criterion=criterion.value,
+                        score=2,
+                        rationale="근거가 확인됩니다.",
+                    )
+                    for criterion in RubricCriterion
+                ],
+                evidence_matches=["질문 근거와 답변이 일치합니다."],
+                evidence_mismatches=[],
+                suspicious_points=[],
+                strengths=["구현 흐름을 설명했습니다."],
+                authenticity_signals=["구체적인 구현 설명"],
+                missing_expected_signals=[],
+                confidence=0.82,
+            )
         if schema is AnswerEvalSchema:
             return AnswerEvalSchema(
                 score=80.0,
@@ -231,7 +273,7 @@ def test_cookie_session_token_allows_interview_state_and_answer(
         },
     )
     assert answer_resp.status_code == 200, answer_resp.text
-    assert answer_resp.json()["status"] == "need_more"
+    assert answer_resp.json()["status"] == "turn_submitted"
 
 
 def test_interview_state_returns_current_question(
@@ -307,11 +349,11 @@ def test_follow_up_answer_is_submitted_as_single_turn(
     assert data["next_question"]["question"] == "리포트 생성 흐름을 설명해 주세요."
 
 
-def test_more_decline_submits_current_draft(
+def test_answer_without_follow_up_submits_immediately(
     evaluation_with_session: dict[str, object],
     fake_llm: FakeInterviewLlm,
 ) -> None:
-    fake_llm.chat_responses = ["answer", "yes"]
+    fake_llm.chat_responses = ["answer"]
     fake_llm.follow_up_question = None
 
     resp = client.post(
@@ -319,17 +361,18 @@ def test_more_decline_submits_current_draft(
         f"/sessions/{evaluation_with_session['session_id']}/interview/answer",
         headers=_headers(evaluation_with_session),
         json={
-            "mode": "more",
-            "answer_text": "없습니다.",
-            "draft_answer": "이미 설명한 답변입니다.",
+            "mode": "answer",
+            "answer_text": "zip 업로드 후 FastAPI 라우터가 분석 작업을 시작합니다.",
+            "draft_answer": "",
         },
     )
 
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["status"] == "turn_submitted"
-    assert data["turn"]["answer_text"] == "이미 설명한 답변입니다."
     assert data["next_mode"] == "answer"
+    assert data["turn"]["answer_text"] == "zip 업로드 후 FastAPI 라우터가 분석 작업을 시작합니다."
+    assert data["next_question"]["question"] == "리포트 생성 흐름을 설명해 주세요."
 
 
 def test_skip_intent_submits_skip_turn(

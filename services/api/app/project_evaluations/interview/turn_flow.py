@@ -16,7 +16,6 @@ from services.api.app.project_evaluations.domain.models import (
 from services.api.app.project_evaluations.interview.intent_classifier import (
     StudentIntent,
     classify_student_intent,
-    is_decline_response,
 )
 from services.api.app.project_evaluations.service import ProjectEvaluationService
 
@@ -87,11 +86,6 @@ class InterviewTurnFlow:
                 session_token,
                 client_id,
             )
-        if payload.mode == InterviewTurnMode.MORE:
-            return self._handle_more(
-                evaluation_id, session_id, payload, session_token, client_id
-            )
-
         intent = classify_student_intent(payload.answer_text, self.service._eval_llm)
         if payload.mode == InterviewTurnMode.FOLLOW_UP:
             if intent == StudentIntent.END_EXAM:
@@ -166,57 +160,16 @@ class InterviewTurnFlow:
                 follow_up_reason=follow_up["reason"],
                 next_mode=InterviewTurnMode.FOLLOW_UP,
             )
-        return InterviewTurnFlowResponse(
-            status=InterviewTurnFlowStatus.NEED_MORE,
-            message="추가로 말씀하실 내용이 있으실까요?",
-            draft_answer=draft_answer,
-            next_mode=InterviewTurnMode.MORE,
-        )
-
-    def _handle_more(
-        self,
-        evaluation_id: str,
-        session_id: str,
-        payload: InterviewTurnFlowRequest,
-        session_token: str | None,
-        client_id: str,
-    ) -> InterviewTurnFlowResponse:
-        intent = classify_student_intent(payload.answer_text, self.service._eval_llm)
-        if intent == StudentIntent.END_EXAM:
-            answer_text = payload.draft_answer.strip() or UNANSWERED_TEXT
-            return self._complete_remaining(
-                evaluation_id, session_id, answer_text, session_token, client_id
-            )
-        if intent == StudentIntent.SKIP:
-            return self._submit_current_turn(
-                evaluation_id,
-                session_id,
-                payload.draft_answer.strip() or SKIP_ANSWER_TEXT,
-                session_token,
-                client_id,
-                "현재 질문 답변을 확정했습니다.",
-                conversation_history=QuestionExchange(
-                    student_answer=payload.draft_answer.strip() or SKIP_ANSWER_TEXT
-                ),
-            )
-        if is_decline_response(payload.answer_text, self.service._eval_llm):
-            return self._submit_current_turn(
-                evaluation_id,
-                session_id,
-                payload.draft_answer.strip() or UNANSWERED_TEXT,
-                session_token,
-                client_id,
-                "추가 답변 없음으로 현재 질문 답변을 저장했습니다.",
-                conversation_history=QuestionExchange(
-                    student_answer=payload.draft_answer.strip() or UNANSWERED_TEXT
-                ),
-            )
-        draft_answer = self._combine_answer(payload.draft_answer, payload.answer_text)
-        return InterviewTurnFlowResponse(
-            status=InterviewTurnFlowStatus.NEED_MORE,
-            message="추가 답변을 반영했습니다. 더 말씀하실 내용이 있으실까요?",
-            draft_answer=draft_answer,
-            next_mode=InterviewTurnMode.MORE,
+        return self._submit_current_turn(
+            evaluation_id,
+            session_id,
+            draft_answer or UNANSWERED_TEXT,
+            session_token,
+            client_id,
+            "현재 질문 답변을 저장했습니다.",
+            conversation_history=QuestionExchange(
+                student_answer=draft_answer or UNANSWERED_TEXT
+            ),
         )
 
     def _ensure_current_question_matches(

@@ -360,13 +360,11 @@ class InterviewTurnCreate(BaseModel):
 
 class InterviewTurnMode(StrEnum):
     ANSWER = "answer"
-    MORE = "more"
     FOLLOW_UP = "follow_up"
     END = "end"
 
 
 class InterviewTurnFlowStatus(StrEnum):
-    NEED_MORE = "need_more"
     NEED_FOLLOW_UP = "need_follow_up"
     TURN_SUBMITTED = "turn_submitted"
     READY_TO_COMPLETE = "ready_to_complete"

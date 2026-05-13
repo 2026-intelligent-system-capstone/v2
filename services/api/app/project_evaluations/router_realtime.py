@@ -264,15 +264,6 @@ function applyFlowResponse(response) {
   followUpQuestion = response.follow_up_question || '';
   followUpReason = response.follow_up_reason || '';
 
-  if (response.status === 'need_more') {
-    currentMode = 'more';
-    renderDraft(draftAnswer);
-    renderFollowUp('');
-    showInfo(response.message || '추가로 말씀하실 내용이 있으시면 입력하세요. 없다면 "없습니다"라고 적어주세요.');
-    document.getElementById('answer').value = '';
-    document.getElementById('answer').focus();
-    return;
-  }
   if (response.status === 'need_follow_up') {
     currentMode = 'follow_up';
     renderDraft(draftAnswer);
@@ -755,7 +746,6 @@ async function apiJson(method, path, body) {
   return res.json();
 }
 
-const MORE_PROMPT_TEXT = '추가로 말씀하실 내용이 있으실까요?';
 const FOLLOW_UP_FALLBACK_TEXT = '꼬리질문에 답변해 주세요.';
 
 const ttsCache = new Map();
@@ -1058,16 +1048,6 @@ async function applyFlowResponse(response) {
   state.followUpQuestion = response.follow_up_question || '';
   state.followUpReason = response.follow_up_reason || '';
 
-  if (response.status === 'need_more') {
-    state.mode = 'more';
-    renderDraft(state.draftAnswer);
-    renderFollowUp('');
-    showInfo(response.message || '추가로 말씀하실 내용이 있으실까요? 없다면 "없습니다"라고 말씀해 주세요.');
-    document.getElementById('answer').value = '';
-    await playTts(MORE_PROMPT_TEXT);
-    readyForRecording();
-    return;
-  }
   if (response.status === 'need_follow_up') {
     state.mode = 'follow_up';
     renderDraft(state.draftAnswer);
@@ -1255,8 +1235,6 @@ document.getElementById('submit-btn').addEventListener('click', () => {
 document.getElementById('replay-btn').addEventListener('click', async () => {
   if (state.mode === 'follow_up' && state.followUpQuestion) {
     await playTts(state.followUpQuestion);
-  } else if (state.mode === 'more') {
-    await playTts(MORE_PROMPT_TEXT);
   } else if (state.questionText) {
     await playTts(state.questionText);
   }
@@ -1304,7 +1282,6 @@ document.getElementById('answer').addEventListener('input', () => {
   syncSubmitFromText();
 });
 
-prefetchTts(MORE_PROMPT_TEXT);
 prefetchTts(FOLLOW_UP_FALLBACK_TEXT);
 
 refreshState();
