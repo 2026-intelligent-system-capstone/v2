@@ -1,10 +1,12 @@
-from collections.abc import Generator
+from collections.abc import AsyncIterator, Generator, Iterator
 import asyncio
+import logging
+import time
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile, status
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -42,6 +44,8 @@ from services.api.app.project_evaluations.persistence.repository import (
 from services.api.app.project_evaluations.service import ProjectEvaluationService
 
 router = APIRouter(prefix="/api/project-evaluations", tags=["project-evaluations"])
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_upload_filename(filename: str) -> str:
@@ -346,6 +350,20 @@ def complete_interview(
     return service.complete_session(evaluation_id, session_id, session_token, request_client_id)
 
 
+@router.post(
+    "/{evaluation_id}/sessions/{session_id}/interview/abort",
+    response_model=EvaluationReportRead,
+)
+def abort_interview(
+    evaluation_id: str,
+    session_id: str,
+    service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
+    session_token: Annotated[str | None, Depends(interview_session_token)],
+) -> EvaluationReportRead:
+    return service.abort_session(evaluation_id, session_id, session_token, request_client_id)
+
+
 class InterviewSpeechSynthesisRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     voice: str | None = Field(default=None, max_length=64)
@@ -363,16 +381,29 @@ async def synthesize_interview_speech(
     service: Annotated[ProjectEvaluationService, Depends(get_service)],
     request_client_id: Annotated[str, Depends(client_id)],
     session_token: Annotated[str | None, Depends(interview_session_token)],
-) -> Response:
+) -> StreamingResponse:
     service.ensure_session(evaluation_id, session_id, session_token, request_client_id)
     speech_service = SpeechService(service.settings)
-    try:
-        audio_bytes = await asyncio.to_thread(
-            speech_service.synthesize_speech,
+
+    loop = asyncio.get_running_loop()
+
+    def open_stream() -> Iterator[bytes]:
+        return speech_service.synthesize_speech_stream(
             payload.text,
             payload.voice,
             payload.instructions,
         )
+
+    request_start = time.monotonic()
+    logger.info(
+        "speech_request_start model=%s chars=%d",
+        service.settings.OPENAI_TTS_MODEL,
+        len(payload.text),
+    )
+
+    try:
+        chunk_iter = await asyncio.to_thread(open_stream)
+        first_chunk = await asyncio.to_thread(next, chunk_iter, None)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -383,8 +414,32 @@ async def synthesize_interview_speech(
                 "error": str(exc),
             },
         ) from exc
-    return Response(
-        content=audio_bytes,
+
+    if first_chunk is None:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "stage": "audio_synthesis",
+                "model": service.settings.OPENAI_TTS_MODEL,
+                "message": "음성 합성 결과가 비어 있습니다.",
+            },
+        )
+
+    logger.info(
+        "speech_request_first_byte ms=%.1f",
+        (time.monotonic() - request_start) * 1000.0,
+    )
+
+    async def stream() -> AsyncIterator[bytes]:
+        yield first_chunk
+        while True:
+            chunk = await loop.run_in_executor(None, next, chunk_iter, None)
+            if chunk is None:
+                return
+            yield chunk
+
+    return StreamingResponse(
+        stream(),
         media_type="audio/mpeg",
         headers={"Cache-Control": "no-store"},
     )
