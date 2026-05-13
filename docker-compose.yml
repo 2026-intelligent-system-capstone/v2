@@ -11,6 +11,7 @@ services:
       QDRANT_URL: http://qdrant:6333
       APP_SQLITE_PATH: /app/data/app.db
       APP_ARTIFACT_DIR: /app/data/artifacts
+      PUBLIC_STREAMLIT_BASE_URL: https://dialearn.presso.ac
     depends_on:
       qdrant:
         condition: service_healthy
