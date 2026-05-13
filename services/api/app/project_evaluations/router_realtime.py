@@ -393,14 +393,17 @@ document.getElementById('answer-form').addEventListener('submit', async (event) 
 });
 
 document.getElementById('end-btn').addEventListener('click', async () => {
-  if (!confirm('인터뷰를 종료하시겠습니까? 남은 질문은 미응답으로 처리됩니다.')) {
+  if (!confirm('인터뷰를 종료하시겠습니까? 남은 질문은 미응답으로 처리되고, 지금까지의 답변으로 리포트가 작성됩니다.')) {
     return;
   }
   showError('');
+  const endBtn = document.getElementById('end-btn');
+  endBtn.disabled = true;
   try {
-    const response = await submitAnswer(' ', 'end');
-    applyFlowResponse(response);
+    const report = await api('POST', '/abort', undefined);
+    renderReport(report);
   } catch (err) {
+    endBtn.disabled = false;
     showError(err.message);
   }
 });
@@ -425,8 +428,15 @@ body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', system-ui, 
 h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; margin-bottom: 4px; }
 .subtitle { font-size: .85rem; color: #64748b; margin-bottom: 20px; }
 #main { width: 100%; max-width: 820px; display: flex; flex-direction: column; gap: 16px; }
-.progress { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #1e293b; border-radius: 10px; font-size: .85rem; color: #94a3b8; }
+.progress { display: flex; align-items: center; gap: 14px; padding: 10px 14px; background: #1e293b; border-radius: 10px; font-size: .85rem; color: #94a3b8; flex-wrap: wrap; }
 .progress strong { color: #e2e8f0; font-weight: 600; }
+.progress-dots { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.dot { width: 14px; height: 14px; border-radius: 50%; border: 1px solid #475569; background: transparent; transition: background .15s, border-color .15s, box-shadow .15s; }
+.dot.done { background: #34d399; border-color: #34d399; }
+.dot.current { background: #7dd3fc; border-color: #7dd3fc; box-shadow: 0 0 0 3px rgba(125,211,252,.25); }
+.dot.pending { background: transparent; border-color: #475569; }
+.dash { color: #475569; user-select: none; font-size: .85rem; }
+.progress-summary { font-size: .85rem; color: #94a3b8; margin-left: auto; }
 .status-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #1e293b; border-radius: 10px; }
 .status-dot { width: 12px; height: 12px; border-radius: 50%; background: #64748b; flex-shrink: 0; transition: background .3s; }
 .status-dot.idle { background: #64748b; }
@@ -500,7 +510,10 @@ audio { display: none; }
 <p class="subtitle">버튼을 눌러 녹음하고, 전사 결과를 확인한 뒤 제출하세요. 텍스트로 진행하려면 <a class="notice" id="staged-link" href="#">단계형 화면</a>으로 이동할 수 있습니다.</p>
 
 <div id="main">
-  <div class="progress" id="progress">세션 상태를 불러오는 중입니다...</div>
+  <div class="progress" id="progress">
+    <div class="progress-dots" id="progress-dots"></div>
+    <span class="progress-summary" id="progress-summary">세션 상태를 불러오는 중입니다...</span>
+  </div>
   <div class="status-bar">
     <div class="status-dot idle" id="status-dot"></div>
     <span class="status-text" id="status-text">대기 중</span>
@@ -580,8 +593,40 @@ function esc(s) {
     .replace(/>/g, '&gt;');
 }
 
-function setProgress(html) {
-  document.getElementById('progress').innerHTML = html;
+function renderProgress(currentIndex, total) {
+  const dots = document.getElementById('progress-dots');
+  const summary = document.getElementById('progress-summary');
+  if (!dots || !summary) return;
+  if (!total || total <= 0) {
+    dots.innerHTML = '';
+    summary.textContent = '세션 상태를 불러오는 중입니다...';
+    return;
+  }
+  const desiredChildren = total + Math.max(0, total - 1);
+  if (dots.childElementCount !== desiredChildren) {
+    dots.innerHTML = '';
+    for (let i = 0; i < total; i += 1) {
+      const dot = document.createElement('span');
+      dot.className = 'dot pending';
+      dot.dataset.idx = String(i);
+      dots.appendChild(dot);
+      if (i < total - 1) {
+        const dash = document.createElement('span');
+        dash.className = 'dash';
+        dash.textContent = '-';
+        dots.appendChild(dash);
+      }
+    }
+  }
+  const nodes = dots.querySelectorAll('.dot');
+  nodes.forEach((node, i) => {
+    let cls = 'dot pending';
+    if (i < currentIndex) cls = 'dot done';
+    else if (i === currentIndex) cls = 'dot current';
+    node.className = cls;
+  });
+  const safeIndex = Math.max(0, Math.min(currentIndex, total - 1));
+  summary.textContent = `질문 ${safeIndex + 1} / ${total}`;
 }
 
 function setStatus(kind, text) {
@@ -661,6 +706,16 @@ function setButtons(opts) {
   }
 }
 
+function syncSubmitFromText() {
+  const submitBtn = document.getElementById('submit-btn');
+  if (!submitBtn) return;
+  const answer = document.getElementById('answer');
+  if (!answer) return;
+  if (answer.value && answer.value.trim().length > 0) {
+    submitBtn.disabled = false;
+  }
+}
+
 function disableAllButtons() {
   setButtons({ canRecord: false, canRerecord: false, canSubmit: false, canReplay: false, canSkip: false, canEnd: false });
 }
@@ -700,7 +755,17 @@ async function apiJson(method, path, body) {
   return res.json();
 }
 
-async function fetchTtsBlob(text) {
+const MORE_PROMPT_TEXT = '추가로 말씀하실 내용이 있으실까요?';
+const FOLLOW_UP_FALLBACK_TEXT = '꼬리질문에 답변해 주세요.';
+
+const ttsCache = new Map();
+const ttsInFlight = new Map();
+
+function ttsCacheKey(text) {
+  return String(text || '');
+}
+
+async function fetchTtsBlobNetwork(text) {
   const res = await fetch(`${API_BASE}/tts`, {
     method: 'POST',
     credentials: 'same-origin',
@@ -722,30 +787,103 @@ async function fetchTtsBlob(text) {
   return res.blob();
 }
 
+function fetchTtsBlob(text) {
+  const key = ttsCacheKey(text);
+  if (ttsCache.has(key)) {
+    return Promise.resolve(ttsCache.get(key));
+  }
+  if (ttsInFlight.has(key)) {
+    return ttsInFlight.get(key);
+  }
+  const promise = (async () => {
+    try {
+      const blob = await fetchTtsBlobNetwork(text);
+      ttsCache.set(key, blob);
+      return blob;
+    } finally {
+      ttsInFlight.delete(key);
+    }
+  })();
+  ttsInFlight.set(key, promise);
+  return promise;
+}
+
+function prefetchTts(text) {
+  if (!text) {
+    return;
+  }
+  const key = ttsCacheKey(text);
+  if (ttsCache.has(key) || ttsInFlight.has(key)) {
+    return;
+  }
+  fetchTtsBlob(text).catch(() => {
+    // Prefetch failures stay silent; the real playTts call will surface them.
+  });
+}
+
+let currentTtsResolve = null;
+
+function stopTtsPlayback() {
+  try {
+    ttsAudio.pause();
+  } catch (_e) {
+    /* noop */
+  }
+  if (ttsAudio.src) {
+    try {
+      URL.revokeObjectURL(ttsAudio.src);
+    } catch (_e) {
+      /* noop */
+    }
+    ttsAudio.removeAttribute('src');
+    try {
+      ttsAudio.load();
+    } catch (_e) {
+      /* noop */
+    }
+  }
+  if (currentTtsResolve) {
+    const resolve = currentTtsResolve;
+    currentTtsResolve = null;
+    resolve();
+  }
+}
+
 async function playTts(text) {
   if (!text) {
     return;
   }
   setStatus('speaking', '인터뷰어가 말하는 중...');
-  disableAllButtons();
+  setButtons({ canRecord: true, canRerecord: false, canSubmit: false, canReplay: false, canSkip: false, canEnd: true });
+  syncSubmitFromText();
+  const tStart = performance.now();
+  const cacheHit = ttsCache.has(ttsCacheKey(text));
   try {
     const blob = await fetchTtsBlob(text);
+    const tBlob = performance.now();
     const url = URL.createObjectURL(blob);
     if (ttsAudio.src) {
       URL.revokeObjectURL(ttsAudio.src);
     }
     ttsAudio.src = url;
     await new Promise((resolve, reject) => {
-      const onEnded = () => { cleanup(); resolve(); };
-      const onError = () => { cleanup(); reject(new Error('TTS 오디오 재생 오류')); };
+      // 외부에서 stopTtsPlayback()이 호출되면 currentTtsResolve를 통해 직접 resolve된다.
+      // 'pause' 이벤트는 src 교체 시 자연 발화될 수 있어 사용하지 않는다.
+      currentTtsResolve = resolve;
+      const onEnded = () => { cleanup(); currentTtsResolve = null; resolve(); };
+      const onError = () => { cleanup(); currentTtsResolve = null; reject(new Error('TTS 오디오 재생 오류')); };
       function cleanup() {
         ttsAudio.removeEventListener('ended', onEnded);
         ttsAudio.removeEventListener('error', onError);
       }
       ttsAudio.addEventListener('ended', onEnded);
       ttsAudio.addEventListener('error', onError);
-      ttsAudio.play().catch((err) => {
+      ttsAudio.play().then(() => {
+        const tPlay = performance.now();
+        console.debug(`[tts] blob=${(tBlob - tStart).toFixed(0)}ms play=${(tPlay - tStart).toFixed(0)}ms cache=${cacheHit}`);
+      }).catch((err) => {
         cleanup();
+        currentTtsResolve = null;
         reject(err);
       });
     });
@@ -887,9 +1025,10 @@ async function uploadAndTranscribe(blob) {
   }
 }
 
-async function submitAnswer(textOverride, modeOverride) {
+async function submitAnswer(textOverride, modeOverride, opts) {
+  const options = opts || {};
   const answerText = (textOverride !== undefined ? textOverride : document.getElementById('answer').value).trim();
-  if (!answerText) {
+  if (!answerText && !options.allowEmpty) {
     showError('답변 텍스트가 비어 있습니다.');
     return;
   }
@@ -925,7 +1064,7 @@ async function applyFlowResponse(response) {
     renderFollowUp('');
     showInfo(response.message || '추가로 말씀하실 내용이 있으실까요? 없다면 "없습니다"라고 말씀해 주세요.');
     document.getElementById('answer').value = '';
-    await playTts('추가로 말씀하실 내용이 있으실까요?');
+    await playTts(MORE_PROMPT_TEXT);
     readyForRecording();
     return;
   }
@@ -933,9 +1072,12 @@ async function applyFlowResponse(response) {
     state.mode = 'follow_up';
     renderDraft(state.draftAnswer);
     renderFollowUp(state.followUpQuestion);
-    showInfo(response.message || '꼬리질문에 답변해 주세요.');
+    showInfo(response.message || FOLLOW_UP_FALLBACK_TEXT);
     document.getElementById('answer').value = '';
-    await playTts(state.followUpQuestion || '꼬리질문에 답변해 주세요.');
+    if (state.followUpQuestion) {
+      prefetchTts(state.followUpQuestion);
+    }
+    await playTts(state.followUpQuestion || FOLLOW_UP_FALLBACK_TEXT);
     readyForRecording();
     return;
   }
@@ -955,7 +1097,7 @@ async function applyFlowResponse(response) {
       state.questionText = response.next_question.question || '';
       state.currentIndex += 1;
       renderQuestion(state.questionText, state.currentIndex, state.totalQuestions);
-      setProgress(`<strong>${state.currentIndex + 1}</strong> / ${state.totalQuestions} 질문 진행 중`);
+      renderProgress(state.currentIndex, state.totalQuestions);
       await playTts(state.questionText);
       readyForRecording();
     } else {
@@ -1013,7 +1155,7 @@ async function refreshState() {
     renderQuestion(state.questionText, state.currentIndex, state.totalQuestions);
     renderFollowUp('');
     renderDraft('');
-    setProgress(`<strong>${state.currentIndex + 1}</strong> / ${state.totalQuestions} 질문 진행 중`);
+    renderProgress(state.currentIndex, state.totalQuestions);
     await playTts(state.questionText);
     readyForRecording();
   } catch (err) {
@@ -1092,9 +1234,13 @@ function renderReport(report) {
 document.getElementById('record-btn').addEventListener('click', () => {
   if (isRecording) {
     stopRecording();
-  } else {
-    startRecording();
+    return;
   }
+  // 인터뷰어 TTS 재생 중에 학생이 녹음을 시작하면 TTS는 즉시 중단한다.
+  if (!ttsAudio.paused) {
+    stopTtsPlayback();
+  }
+  startRecording();
 });
 
 document.getElementById('rerecord-btn').addEventListener('click', () => {
@@ -1110,7 +1256,7 @@ document.getElementById('replay-btn').addEventListener('click', async () => {
   if (state.mode === 'follow_up' && state.followUpQuestion) {
     await playTts(state.followUpQuestion);
   } else if (state.mode === 'more') {
-    await playTts('추가로 말씀하실 내용이 있으실까요?');
+    await playTts(MORE_PROMPT_TEXT);
   } else if (state.questionText) {
     await playTts(state.questionText);
   }
@@ -1125,10 +1271,26 @@ document.getElementById('skip-btn').addEventListener('click', async () => {
 });
 
 document.getElementById('end-btn').addEventListener('click', async () => {
-  if (!confirm('인터뷰를 종료하시겠습니까? 남은 질문은 미응답으로 처리됩니다.')) {
+  if (!confirm('인터뷰를 종료하시겠습니까? 남은 질문은 미응답으로 처리되고, 지금까지의 답변으로 리포트가 작성됩니다.')) {
     return;
   }
-  await submitAnswer(' ', 'end');
+  if (!ttsAudio.paused) {
+    stopTtsPlayback();
+  }
+  if (isRecording) {
+    stopRecording();
+  }
+  disableAllButtons();
+  setStatus('submitting', '리포트를 작성하는 중입니다...');
+  showError('');
+  try {
+    const report = await apiJson('POST', '/abort', undefined);
+    renderReport(report);
+  } catch (err) {
+    showError('인터뷰 종료 실패: ' + (err.message || err));
+    setStatus('error', '인터뷰 종료 처리에 실패했습니다.');
+    setButtons({ canRecord: false, canRerecord: false, canSubmit: false, canReplay: false, canSkip: false, canEnd: true });
+  }
 });
 
 window.addEventListener('beforeunload', () => {
@@ -1136,6 +1298,14 @@ window.addEventListener('beforeunload', () => {
     recorderStream.getTracks().forEach((track) => track.stop());
   }
 });
+
+document.getElementById('answer').addEventListener('input', () => {
+  // 학생이 STT 단계 없이 textarea에 직접 답변을 적었을 때도 제출이 가능해야 한다.
+  syncSubmitFromText();
+});
+
+prefetchTts(MORE_PROMPT_TEXT);
+prefetchTts(FOLLOW_UP_FALLBACK_TEXT);
 
 refreshState();
 </script>
@@ -1178,7 +1348,40 @@ async def set_interview_cookie(
         )
         service.ensure_session(evaluation_id, session_id, session_token, client_id)
 
-    response = RedirectResponse(f"/interview/{evaluation_id}/{session_id}", status_code=303)
+    response = RedirectResponse(
+        f"/interview/{evaluation_id}/{session_id}/voice", status_code=303
+    )
+    response.set_cookie(
+        key=f"interview_session_{session_id}",
+        value=session_token,
+        httponly=True,
+        samesite="strict",
+        max_age=60 * 60 * 2,
+        secure=request.url.scheme == "https",
+    )
+    return response
+
+
+@router.get("/interview/{evaluation_id}/{session_id}/enter")
+async def enter_interview(
+    request: Request,
+    evaluation_id: str,
+    session_id: str,
+    session_token: str,
+) -> RedirectResponse:
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    client_id = request.client.host if request.client else "local"
+    with session_factory() as db_session:
+        service = ProjectEvaluationService(
+            ProjectEvaluationRepository(db_session),
+            settings,
+        )
+        service.ensure_session(evaluation_id, session_id, session_token, client_id)
+
+    response = RedirectResponse(
+        f"/interview/{evaluation_id}/{session_id}/voice", status_code=303
+    )
     response.set_cookie(
         key=f"interview_session_{session_id}",
         value=session_token,

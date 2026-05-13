@@ -846,14 +846,10 @@ def render_student() -> None:
         evaluation = joined.get("evaluation", {})
         path = str(joined.get("interview_url_path", ""))
         interview_url = f"{get_api_base_url()}{path}"
-        st.subheader("단계형 프로젝트 인터뷰")
+        st.subheader("음성 프로젝트 인터뷰")
         st.caption(f"방: {evaluation.get('room_name', evaluation.get('project_name', '-'))}")
         st.success(f"세션 준비 완료 · 세션 ID: {session.get('id', '-')}")
-        session_token = str(session.get("session_token", ""))
-        if session_token:
-            st.code(session_token, language=None)
-        st.info("아래 버튼을 클릭한 뒤 표시된 세션 토큰을 한 번 입력하면 단계형 인터뷰가 시작됩니다.")
-        st.link_button("단계형 인터뷰 시작", interview_url, type="primary")
+        st.link_button("음성 인터뷰 시작", interview_url, type="primary")
 
 
 def render_report(report: dict[str, object]) -> None:
