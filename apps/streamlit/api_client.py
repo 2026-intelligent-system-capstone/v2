@@ -197,11 +197,20 @@ def get_evaluation_status(evaluation_id: str, admin_password: str = "") -> dict[
     )
 
 
-def list_questions(evaluation_id: str, admin_password: str = "") -> list[dict[str, object]]:
+def list_questions(
+    evaluation_id: str,
+    admin_password: str = "",
+    session_id: str = "",
+    session_token: str = "",
+) -> list[dict[str, object]]:
+    headers: dict[str, str] = {"X-Admin-Password": admin_password}
+    if session_id and session_token:
+        headers["X-Session-Id"] = session_id
+        headers["X-Session-Token"] = session_token
     return request_json_list(
         "GET",
         f"/api/project-evaluations/{evaluation_id}/questions",
-        headers={"X-Admin-Password": admin_password},
+        headers=headers,
     )
 
 

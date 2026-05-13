@@ -29,6 +29,7 @@ class ApiSettings(BaseSettings):
     APP_MAX_PDF_PAGES: int = 30
     APP_MAX_DOCX_PARAGRAPHS: int = 2_000
     APP_MAX_PPTX_SLIDES: int = 80
+    PUBLIC_STREAMLIT_BASE_URL: str = "http://localhost:8501"
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=True, extra="ignore"

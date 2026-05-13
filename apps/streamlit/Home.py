@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from apps.streamlit.api_client import (
     ApiClientError,
+    complete_session,
     create_evaluation,
     extract_evaluation,
     generate_questions,
@@ -104,7 +105,13 @@ def query_param_value(name: str) -> str:
 
 
 def init_state() -> None:
-    initial_mode = "student" if query_param_value("mode") == "student" else "home"
+    query_mode = query_param_value("mode")
+    if query_mode == "student_report":
+        initial_mode = "student_report"
+    elif query_mode == "student":
+        initial_mode = "student"
+    else:
+        initial_mode = "home"
     defaults = {
         "mode": initial_mode,
         "step": "join" if initial_mode == "student" else "manage",
@@ -873,6 +880,55 @@ def render_professor() -> None:
             )
 
 
+def render_student_report() -> None:
+    """학생이 인터뷰 완료 후 진입하는 리포트 화면.
+
+    `/interview/{eval}/{session}/report-redirect` (FastAPI) 가 쿠키의 세션 토큰을
+    쿼리 파라미터로 옮겨 이 화면으로 보낸다. 여기서는 세션 토큰으로
+    complete_session(idempotent) + list_turns + list_questions 를 호출해
+    공용 render_report 컴포넌트로 그대로 렌더한다.
+    """
+    st.header("인터뷰 리포트")
+
+    evaluation_id = query_param_value("evaluation_id")
+    session_id = query_param_value("session_id")
+    session_token = query_param_value("session_token")
+
+    if not (evaluation_id and session_id and session_token):
+        st.error(
+            "리포트 화면 진입에 필요한 정보가 부족합니다. "
+            "인터뷰 페이지에서 다시 진입해 주세요."
+        )
+        return
+
+    report, report_err = call_api_capture_error(
+        complete_session, evaluation_id, session_id, session_token
+    )
+    if report_err is not None or not isinstance(report, dict):
+        st.error("리포트를 불러오지 못했습니다.")
+        if report_err is not None:
+            render_api_error(report_err)
+        return
+
+    questions_data, q_err = call_api_capture_error(
+        list_questions, evaluation_id, "", session_id, session_token
+    )
+    questions_list = questions_data if isinstance(questions_data, list) else None
+
+    turns_data, t_err = call_api_capture_error(
+        list_turns, evaluation_id, session_id, session_token
+    )
+    turns_list = turns_data if isinstance(turns_data, list) else None
+
+    render_report(
+        report,
+        questions=questions_list,
+        turns=turns_list,
+        questions_error=str(q_err) if q_err is not None else "",
+        turns_error=str(t_err) if t_err is not None else "",
+    )
+
+
 def render_student() -> None:
     st.header("학생/지원자: 방 입장")
     with st.form("join_room_form"):
@@ -947,3 +1003,5 @@ elif mode == "student":
     if st.button("시작 화면으로 돌아가기"):
         set_mode("home")
     render_student()
+elif mode == "student_report":
+    render_student_report()

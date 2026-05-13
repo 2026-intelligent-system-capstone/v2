@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Form, Request
+from urllib.parse import urlencode
+
+from fastapi import APIRouter, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from services.api.app.project_evaluations.persistence.repository import (
@@ -226,11 +228,11 @@ async function refreshState() {
     totalQuestions = state.total_questions || 0;
     if (state.is_completed) {
       try {
-        const report = await api('POST', '/complete', undefined);
-        renderReport(report);
+        await api('POST', '/complete', undefined);
       } catch (_e) {
-        setProgress('인터뷰가 완료되었습니다.');
+        // ignore — redirect 후 Streamlit이 idempotent complete를 재호출한다.
       }
+      goToReport();
       return;
     }
     setProgress(`<strong>${state.current_question_index + 1}</strong> / ${state.total_questions} 질문 진행 중`);
@@ -286,80 +288,23 @@ function applyFlowResponse(response) {
   }
 
   if (response.status === 'ready_to_complete' || response.status === 'completed') {
-    if (response.report) {
-      renderReport(response.report);
-      return;
-    }
     finalizeAndRender();
   }
 }
 
+function goToReport() {
+  window.location.href = `/interview/${EVAL_ID}/${SESSION_ID}/report-redirect`;
+}
+
 async function finalizeAndRender() {
   try {
-    const report = await api('POST', '/complete', undefined);
-    renderReport(report);
+    await api('POST', '/complete', undefined);
   } catch (err) {
+    // 이미 완료된 세션이면 server가 기존 리포트를 그대로 반환하므로 무시 가능.
+    // 그 외 오류는 노출하지만 리포트 화면으로는 그래도 이동시킨다.
     showError(err.message);
   }
-}
-
-function vClass(v) {
-  if (v === '검증 통과') return 'pass';
-  if (v === '신뢰 낮음') return 'fail';
-  return 'caution';
-}
-
-function tag(v) {
-  return `<span class="tag ${vClass(v)}">${esc(v)}</span>`;
-}
-
-function listHtml(arr) {
-  if (!arr || !arr.length) return '<p class="muted">없음</p>';
-  return '<ul class="bullet">' + arr.map((s) => `<li>${esc(String(s))}</li>`).join('') + '</ul>';
-}
-
-function renderReport(report) {
-  document.getElementById('main').style.display = 'none';
-  const view = document.getElementById('report-view');
-  const score = typeof report.authenticity_score === 'number'
-    ? report.authenticity_score.toFixed(1)
-    : report.authenticity_score;
-  const verdictClass = vClass(report.final_decision);
-  let html = `<div class="report-header"><div class="verdict ${verdictClass}">${esc(report.final_decision)}</div>`
-    + `<div class="score-badge">신뢰도 점수 : ${esc(score)}</div></div>`
-    + `<div class="section"><h3>인터뷰 요약</h3><p>${esc(report.summary || '')}</p></div>`;
-
-  if (report.area_analyses && report.area_analyses.length) {
-    html += '<div class="section"><h3>프로젝트 영역별 신뢰도</h3>'
-      + '<table><thead><tr><th>영역</th><th>판정</th><th>점수</th><th>근거</th></tr></thead><tbody>';
-    report.area_analyses.forEach((area) => {
-      html += `<tr><td>${esc(area.area_name || '')}</td><td>${tag(area.decision || '')}</td>`
-        + `<td>${esc(typeof area.score === 'number' ? area.score.toFixed(1) : area.score)}</td>`
-        + `<td style="font-size:.8rem">${esc(area.summary || '')}</td></tr>`;
-    });
-    html += '</tbody></table></div>';
-  }
-
-  if (report.question_evaluations && report.question_evaluations.length) {
-    html += '<div class="section"><h3>질문별 평가</h3>'
-      + '<table><thead><tr><th>#</th><th>질문</th><th>점수</th><th>Bloom</th></tr></thead><tbody>';
-    report.question_evaluations.forEach((q) => {
-      html += `<tr><td>${esc(q.order_index != null ? q.order_index + 1 : '')}</td>`
-        + `<td style="font-size:.8rem">${esc(q.question || '')}</td>`
-        + `<td>${esc(typeof q.score === 'number' ? q.score.toFixed(1) : q.score)}</td>`
-        + `<td>${esc(q.bloom_level || '')}</td></tr>`;
-    });
-    html += '</tbody></table></div>';
-  }
-
-  html += `<div class="section"><h3>강점</h3>${listHtml(report.strengths)}</div>`
-    + `<div class="section"><h3>의심 지점</h3>${listHtml(report.suspicious_points)}</div>`
-    + `<div class="section"><h3>근거 일치</h3>${listHtml(report.evidence_alignment)}</div>`
-    + `<div class="section"><h3>추가 확인 질문</h3>${listHtml(report.recommended_followups)}</div>`;
-
-  view.innerHTML = html;
-  view.style.display = 'flex';
-  view.scrollIntoView({ behavior: 'smooth' });
+  goToReport();
 }
 
 document.getElementById('answer-form').addEventListener('submit', async (event) => {
@@ -391,12 +336,13 @@ document.getElementById('end-btn').addEventListener('click', async () => {
   const endBtn = document.getElementById('end-btn');
   endBtn.disabled = true;
   try {
-    const report = await api('POST', '/abort', undefined);
-    renderReport(report);
+    await api('POST', '/abort', undefined);
   } catch (err) {
     endBtn.disabled = false;
     showError(err.message);
+    return;
   }
+  goToReport();
 });
 
 refreshState();
@@ -1093,23 +1039,25 @@ async function applyFlowResponse(response) {
   }
 
   if (response.status === 'completed') {
-    if (response.report) {
-      renderReport(response.report);
-    } else {
-      await finalizeAndRender();
-    }
+    await finalizeAndRender();
   }
+}
+
+function goToReport() {
+  window.location.href = '/interview/' + EVAL_ID + '/' + SESSION_ID + '/report-redirect';
 }
 
 async function finalizeAndRender() {
   setStatus('submitting', '리포트 생성 중...');
   try {
-    const report = await apiJson('POST', '/complete', undefined);
-    renderReport(report);
+    await apiJson('POST', '/complete', undefined);
   } catch (err) {
-    showError('리포트 생성 실패: ' + (err.message || err));
-    setStatus('error', '리포트 생성 실패');
+    // 이미 완료된 세션이면 server가 기존 리포트를 그대로 반환하므로 무시 가능하다.
+    // 그 외 실패는 화면에 표시하지만 리포트 페이지로는 그래도 이동시킨다.
+    showError('리포트 생성 응답 오류: ' + (err.message || err));
+    setStatus('error', '리포트 페이지로 이동합니다.');
   }
+  goToReport();
 }
 
 async function refreshState() {
@@ -1142,73 +1090,6 @@ async function refreshState() {
     showError('세션 상태 조회 실패: ' + (err.message || err));
     setStatus('error', '세션 상태를 가져올 수 없습니다.');
   }
-}
-
-function vClass(v) {
-  if (v === '검증 통과') return 'pass';
-  if (v === '신뢰 낮음') return 'fail';
-  return 'caution';
-}
-
-function tag(v) {
-  return '<span class="tag ' + vClass(v) + '">' + esc(v) + '</span>';
-}
-
-function listHtml(arr) {
-  if (!arr || !arr.length) return '<p style="color:#64748b;font-size:.85rem">없음</p>';
-  return '<ul class="bullet">' + arr.map(function(s) {
-    return '<li>' + esc(String(s)) + '</li>';
-  }).join('') + '</ul>';
-}
-
-function renderReport(report) {
-  disableAllButtons();
-  document.getElementById('main').style.display = 'none';
-  const view = document.getElementById('report-view');
-  const score = typeof report.authenticity_score === 'number'
-    ? report.authenticity_score.toFixed(1)
-    : report.authenticity_score;
-  const verdictClass = vClass(report.final_decision);
-
-  let html = '<div class="report-header">'
-    + '<div class="verdict ' + verdictClass + '">' + esc(report.final_decision) + '</div>'
-    + '<div class="score-badge">신뢰도 점수 : ' + esc(score) + '</div>'
-    + '</div>'
-    + '<div class="section"><h3>인터뷰 요약</h3><p>' + esc(report.summary || '') + '</p></div>';
-
-  if (report.area_analyses && report.area_analyses.length) {
-    html += '<div class="section"><h3>프로젝트 영역별 신뢰도</h3>'
-      + '<table><thead><tr><th>영역</th><th>판정</th><th>점수</th><th>근거</th></tr></thead><tbody>';
-    report.area_analyses.forEach(function(area) {
-      html += '<tr><td>' + esc(area.area_name || '') + '</td><td>' + tag(area.decision || '') + '</td>'
-        + '<td>' + esc(typeof area.score === 'number' ? area.score.toFixed(1) : area.score) + '</td>'
-        + '<td style="font-size:.8rem">' + esc(area.summary || '') + '</td></tr>';
-    });
-    html += '</tbody></table></div>';
-  }
-
-  if (report.question_evaluations && report.question_evaluations.length) {
-    html += '<div class="section"><h3>질문별 평가</h3>'
-      + '<table><thead><tr><th>#</th><th>질문</th><th>점수</th><th>Bloom</th></tr></thead><tbody>';
-    report.question_evaluations.forEach(function(question) {
-      html += '<tr><td>' + esc(question.order_index != null ? question.order_index + 1 : '') + '</td>'
-        + '<td style="font-size:.8rem">' + esc(question.question || '') + '</td>'
-        + '<td>' + esc(typeof question.score === 'number' ? question.score.toFixed(1) : question.score) + '</td>'
-        + '<td>' + esc(question.bloom_level || '') + '</td></tr>';
-    });
-    html += '</tbody></table></div>';
-  }
-
-  html += '<div class="grid2">'
-    + '<div class="section"><h3>강점</h3>' + listHtml(report.strengths) + '</div>'
-    + '<div class="section"><h3>의심 지점</h3>' + listHtml(report.suspicious_points) + '</div>'
-    + '<div class="section"><h3>근거 일치</h3>' + listHtml(report.evidence_alignment) + '</div>'
-    + '<div class="section"><h3>추가 확인 질문</h3>' + listHtml(report.recommended_followups) + '</div>'
-    + '</div>';
-
-  view.innerHTML = html;
-  view.style.display = 'flex';
-  view.scrollIntoView({ behavior: 'smooth' });
 }
 
 document.getElementById('record-btn').addEventListener('click', () => {
@@ -1262,13 +1143,14 @@ document.getElementById('end-btn').addEventListener('click', async () => {
   setStatus('submitting', '리포트를 작성하는 중입니다...');
   showError('');
   try {
-    const report = await apiJson('POST', '/abort', undefined);
-    renderReport(report);
+    await apiJson('POST', '/abort', undefined);
   } catch (err) {
     showError('인터뷰 종료 실패: ' + (err.message || err));
     setStatus('error', '인터뷰 종료 처리에 실패했습니다.');
     setButtons({ canRecord: false, canRerecord: false, canSubmit: false, canReplay: false, canSkip: false, canEnd: true });
+    return;
   }
+  goToReport();
 });
 
 window.addEventListener('beforeunload', () => {
@@ -1378,3 +1260,34 @@ async def get_staged_interview_page(evaluation_id: str, session_id: str) -> str:
 @router.get("/interview/{evaluation_id}/{session_id}/voice", response_class=HTMLResponse)
 async def get_voice_interview_page(evaluation_id: str, session_id: str) -> str:
     return _VOICE_HTML
+
+
+@router.get("/interview/{evaluation_id}/{session_id}/report-redirect")
+async def redirect_to_streamlit_report(
+    request: Request,
+    evaluation_id: str,
+    session_id: str,
+) -> RedirectResponse:
+    """인터뷰 완료 후 학생을 Streamlit 리포트 페이지로 보내는 경로.
+
+    `interview_session_{session_id}` 쿠키에서 세션 토큰을 읽어
+    Streamlit URL 쿼리에 동봉한다. 쿠키는 httponly여서 JS로는 읽을 수 없으므로
+    이 서버측 redirect가 토큰 전달 경로 역할을 한다.
+    """
+    session_token = request.cookies.get(f"interview_session_{session_id}")
+    if not session_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="인터뷰 세션 토큰이 없습니다. 다시 입장해 주세요.",
+        )
+    settings = request.app.state.settings
+    base_url = settings.PUBLIC_STREAMLIT_BASE_URL.rstrip("/")
+    query = urlencode(
+        {
+            "mode": "student_report",
+            "evaluation_id": evaluation_id,
+            "session_id": session_id,
+            "session_token": session_token,
+        }
+    )
+    return RedirectResponse(f"{base_url}/?{query}", status_code=303)

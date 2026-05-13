@@ -207,9 +207,17 @@ def generate_questions(
 def list_questions(
     evaluation_id: str,
     service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
     x_admin_password: Annotated[str | None, Header()] = None,
+    x_session_id: Annotated[str | None, Header()] = None,
+    x_session_token: Annotated[str | None, Header()] = None,
 ) -> list[InterviewQuestionRead]:
-    service.ensure_admin(evaluation_id, x_admin_password)
+    if x_session_id and x_session_token:
+        service.ensure_session(
+            evaluation_id, x_session_id, x_session_token, request_client_id
+        )
+    else:
+        service.ensure_admin(evaluation_id, x_admin_password)
     return service.list_questions(evaluation_id)
 
 
