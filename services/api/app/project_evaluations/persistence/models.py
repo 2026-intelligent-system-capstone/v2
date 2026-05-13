@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -138,6 +138,9 @@ class InterviewSessionRow(Base):
 
 class InterviewTurnRow(Base):
     __tablename__ = "interview_turns"
+    __table_args__ = (
+        UniqueConstraint("session_id", "question_id", name="uq_interview_turn_session_question"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     session_id: Mapped[str] = mapped_column(
@@ -161,6 +164,9 @@ class InterviewTurnRow(Base):
     )
     strengths_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     follow_up_question: Mapped[str | None] = mapped_column(Text, nullable=True)
+    follow_up_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    finalized_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    conversation_history_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now
     )

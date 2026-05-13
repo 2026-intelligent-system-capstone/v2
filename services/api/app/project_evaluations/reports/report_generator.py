@@ -29,12 +29,18 @@ def generate_report_payload(
         raise RuntimeError(
             f"리포트 생성 입력의 질문/답변 수가 일치하지 않습니다. questions={len(questions)}, turns={len(turns)}"
         )
-    score = round(sum(turn.score for turn in turns) / len(turns), 2)
+    effective_scores = [
+        turn.finalized_score if turn.finalized_score is not None else turn.score
+        for turn in turns
+    ]
+    score = round(sum(effective_scores) / len(effective_scores), 2)
     questions_by_id = {question.id: question for question in questions}
     area_names = {area.id: area.name for area in areas}
     question_evaluations = []
     scores_by_area: dict[str, list[float]] = defaultdict(list)
-    bloom_summary: dict[str, int] = defaultdict(int)
+    scores_by_bloom: dict[str, list[float]] = defaultdict(list)
+    rubric_scores_by_criterion: dict[str, list[int]] = defaultdict(list)
+    bloom_summary: dict[str, dict[str, Any]] = {}
     strengths = []
     suspicious_points = []
     evidence_alignment = []
@@ -47,28 +53,30 @@ def generate_report_payload(
             raise RuntimeError(f"답변에 연결된 질문을 찾을 수 없습니다. question_id={turn.question_id}")
         area_name = "프로젝트 전체"
         bloom_level = question.bloom_level
-        bloom_summary[bloom_level] += 1
         if question.project_area_id:
             area_name = area_names.get(question.project_area_id, area_name)
-        scores_by_area[area_name].append(turn.score)
+        effective_score = turn.finalized_score if turn.finalized_score is not None else turn.score
+        scores_by_area[area_name].append(effective_score)
+        scores_by_bloom[bloom_level].append(effective_score)
         strengths.extend(from_json(turn.strengths_json, []))
         suspicious_points.extend(from_json(turn.suspicious_points_json, []))
         evidence_alignment.extend(from_json(turn.evidence_matches_json, []))
-        recommended_followups.extend(from_json(turn.evidence_mismatches_json, []))
         source_refs = from_json(question.source_refs_json, [])
         if not source_refs:
             raise RuntimeError(f"리포트 입력 질문에 source refs가 없습니다. question_id={question.id}")
         rubric_scores = rubric_scores_by_turn.get(turn.id, [])
         if not rubric_scores:
             raise RuntimeError(f"리포트 입력 답변에 루브릭 점수 상세가 없습니다. turn_id={turn.id}")
-        if turn.follow_up_question:
+        for rubric_score in rubric_scores:
+            rubric_scores_by_criterion[str(rubric_score["criterion"])].append(int(rubric_score["score"]))
+        if turn.follow_up_question and turn.finalized_score is None:
             recommended_followups.append(turn.follow_up_question)
         question_evaluations.append(
             {
                 "question_id": turn.question_id,
                 "question": turn.question_text,
                 "answer_preview": turn.answer_text[:500],
-                "score": turn.score,
+                "score": effective_score,
                 "summary": turn.evaluation_summary,
                 "area": area_name,
                 "bloom_level": bloom_level,
@@ -78,8 +86,15 @@ def generate_report_payload(
                 "evidence_mismatches": from_json(turn.evidence_mismatches_json, []),
                 "suspicious_points": from_json(turn.suspicious_points_json, []),
                 "follow_up_question": turn.follow_up_question,
+                "needs_follow_up": bool(turn.follow_up_question and turn.finalized_score is None),
             }
         )
+
+    for bloom_level, values in sorted(scores_by_bloom.items()):
+        bloom_summary[bloom_level] = {
+            "question_count": len(values),
+            "average_score": round(sum(values) / len(values), 2),
+        }
 
     area_source_refs = {
         area.name: from_json(area.source_refs_json, [])
@@ -95,8 +110,20 @@ def generate_report_payload(
         for area, values in sorted(scores_by_area.items())
     ]
     rubric_summary = {
-        "평가 방식": "LLM 루브릭 평가 결과를 기반으로 최종 LLM 리포트에서 재해석",
-        "평균 점수": score,
+        criterion: {
+            "average_score": round(sum(values) / len(values), 2),
+            "max_score": 3,
+            "question_count": len(values),
+        }
+        for criterion, values in sorted(rubric_scores_by_criterion.items())
+    }
+    rubric_summary["overall"] = {
+        "evaluation_method": "질문별 구술형 rubric score를 criterion별로 집계하고 최종 리포트 LLM이 재해석",
+        "average_score": score,
+        "turn_count": len(turns),
+        "follow_up_required_count": sum(
+            1 for turn in turns if turn.follow_up_question and turn.finalized_score is None
+        ),
     }
     report_input = {
         "preliminary_score_average": score,

@@ -189,6 +189,17 @@ class RubricScoreItem(BaseModel):
     rationale: str = ""
 
 
+class FollowUpExchange(BaseModel):
+    question: str
+    answer: str
+    reason: str = ""
+
+
+class QuestionExchange(BaseModel):
+    student_answer: str
+    follow_ups: list[FollowUpExchange] = Field(default_factory=list)
+
+
 class ProjectEvaluationCreate(BaseModel):
     project_name: str = Field(min_length=1, max_length=200)
     candidate_name: str = Field(default="", max_length=200)
@@ -347,6 +358,26 @@ class InterviewTurnCreate(BaseModel):
     answer_text: str = Field(min_length=1, max_length=10000)
 
 
+class InterviewTurnMode(StrEnum):
+    ANSWER = "answer"
+    MORE = "more"
+    FOLLOW_UP = "follow_up"
+    END = "end"
+
+
+class InterviewTurnFlowStatus(StrEnum):
+    NEED_MORE = "need_more"
+    NEED_FOLLOW_UP = "need_follow_up"
+    TURN_SUBMITTED = "turn_submitted"
+    READY_TO_COMPLETE = "ready_to_complete"
+    COMPLETED = "completed"
+
+
+class InterviewTranscriptionRead(BaseModel):
+    transcript: str
+    mode: InterviewTurnMode
+
+
 class InterviewTurnRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -363,7 +394,40 @@ class InterviewTurnRead(BaseModel):
     suspicious_points: list[str] = Field(default_factory=list)
     strengths: list[str] = Field(default_factory=list)
     follow_up_question: str | None = None
+    follow_up_reason: str = ""
+    finalized_score: float | None = None
+    conversation_history: QuestionExchange | None = None
     created_at: datetime
+
+
+class StudentInterviewStateRead(BaseModel):
+    session_id: str
+    current_question_index: int
+    total_questions: int
+    question: InterviewQuestionRead | None = None
+    turns: list[InterviewTurnRead] = Field(default_factory=list)
+    is_completed: bool = False
+
+
+class InterviewTurnFlowRequest(BaseModel):
+    mode: InterviewTurnMode = InterviewTurnMode.ANSWER
+    answer_text: str = Field(min_length=1, max_length=10000)
+    draft_answer: str = Field(default="", max_length=20000)
+    follow_up_question: str = Field(default="", max_length=2000)
+    follow_up_reason: str = Field(default="", max_length=4000)
+    current_question_id: str | None = None
+
+
+class InterviewTurnFlowResponse(BaseModel):
+    status: InterviewTurnFlowStatus
+    message: str
+    draft_answer: str = ""
+    follow_up_question: str | None = None
+    follow_up_reason: str = ""
+    next_mode: InterviewTurnMode | None = None
+    turn: InterviewTurnRead | None = None
+    next_question: InterviewQuestionRead | None = None
+    report: "EvaluationReportRead | None" = None
 
 
 class EvaluationReportRead(BaseModel):

@@ -8,6 +8,7 @@ from collections import Counter
 from collections.abc import Callable
 
 from fastapi import HTTPException, UploadFile, status
+from sqlalchemy.exc import IntegrityError
 
 from services.api.app.project_evaluations.rag.redaction import redact_sensitive_text
 
@@ -31,6 +32,7 @@ from services.api.app.project_evaluations.domain.models import (
     ProjectEvaluationCreate,
     ProjectEvaluationRead,
     ProjectEvaluationStatusRead,
+    QuestionExchange,
 )
 from services.api.app.project_evaluations.ingestion.file_classifier import (
     CODE_EXTENSIONS,
@@ -39,7 +41,11 @@ from services.api.app.project_evaluations.ingestion.file_classifier import (
 from services.api.app.project_evaluations.ingestion.zip_handler import (
     extract_zip_artifacts,
 )
-from services.api.app.project_evaluations.interview.evaluator import evaluate_answer
+from services.api.app.project_evaluations.interview.evaluator import (
+    conversation_history_text,
+    evaluate_answer,
+    finalize_oral_evaluation,
+)
 from services.api.app.project_evaluations.interview.question_generator import (
     generate_questions,
 )
@@ -754,6 +760,10 @@ class ProjectEvaluationService:
         payload: InterviewTurnCreate,
         session_token: str | None = None,
         client_id: str = "local",
+        allow_follow_up_required: bool = False,
+        follow_up_question: str | None = None,
+        follow_up_reason: str = "",
+        conversation_history: QuestionExchange | None = None,
     ) -> InterviewTurnRead:
         session = self.ensure_session(evaluation_id, session_id, session_token, client_id)
         question = self.repository.get_question_row(payload.question_id)
@@ -777,8 +787,47 @@ class ProjectEvaluationService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail="이미 답변한 질문입니다.",
             )
+
+        current_exchange = conversation_history or QuestionExchange(
+            student_answer=payload.answer_text.strip() or "(답변 없음)"
+        )
+        current_history_text = conversation_history_text(current_exchange)
+        follow_up_count = len(current_exchange.follow_ups)
+
         try:
-            evaluation = evaluate_answer(question, payload.answer_text, llm=self._eval_llm)
+            evaluation = evaluate_answer(
+                question,
+                payload.answer_text,
+                llm=self._eval_llm,
+                conversation_history=current_history_text,
+                follow_up_count=follow_up_count,
+            )
+            if evaluation["needs_follow_up"]:
+                if not allow_follow_up_required:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "stage": "interview_turn",
+                            "reason": "follow_up_required",
+                            "message": "현재 답변은 꼬리질문 확인 후 저장해야 합니다.",
+                            "follow_up_question": evaluation["follow_up_question"],
+                            "follow_up_reason": evaluation["follow_up_reason"],
+                        },
+                    )
+                finalized = finalize_oral_evaluation(
+                    question,
+                    payload.answer_text,
+                    llm=self._eval_llm,
+                    conversation_history=current_history_text,
+                )
+                evaluation = {
+                    "needs_follow_up": False,
+                    "follow_up_reason": follow_up_reason,
+                    "follow_up_question": follow_up_question,
+                    **finalized,
+                }
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -790,19 +839,76 @@ class ProjectEvaluationService:
                     question_id=payload.question_id,
                 ),
             ) from exc
-        return self.repository.create_turn(
-            session_id=session_id,
-            question=question,
-            answer_text=payload.answer_text,
-            score=float(evaluation["score"]),
-            evaluation_summary=str(evaluation["evaluation_summary"]),
-            rubric_scores=list(evaluation["rubric_scores"]),
-            evidence_matches=list(evaluation["evidence_matches"]),
-            evidence_mismatches=list(evaluation["evidence_mismatches"]),
-            suspicious_points=list(evaluation["suspicious_points"]),
-            strengths=list(evaluation["strengths"]),
-            follow_up_question=evaluation["follow_up_question"],
+        try:
+            return self.repository.create_turn(
+                session_id=session_id,
+                question=question,
+                answer_text=payload.answer_text,
+                score=float(evaluation["score"]),
+                evaluation_summary=str(evaluation["evaluation_summary"]),
+                rubric_scores=list(evaluation["rubric_scores"]),
+                evidence_matches=list(evaluation["evidence_matches"]),
+                evidence_mismatches=list(evaluation["evidence_mismatches"]),
+                suspicious_points=list(evaluation["suspicious_points"]),
+                strengths=list(evaluation["strengths"]),
+                follow_up_question=follow_up_question or evaluation.get("follow_up_question"),
+                follow_up_reason=follow_up_reason or str(evaluation.get("follow_up_reason", "")),
+                finalized_score=float(evaluation["score"]),
+                conversation_history=current_exchange,
+            )
+        except IntegrityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="이미 답변한 질문입니다.",
+            ) from exc
+
+    def preview_follow_up_question(
+        self,
+        evaluation_id: str,
+        session_id: str,
+        question_order_index: int,
+        exchange: QuestionExchange,
+        session_token: str | None = None,
+        client_id: str = "local",
+    ) -> dict[str, str] | None:
+        self.ensure_session(evaluation_id, session_id, session_token, client_id)
+        questions = self.repository.list_question_rows(evaluation_id)
+        if question_order_index < 0 or question_order_index >= len(questions):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="꼬리질문을 생성할 질문 순서가 올바르지 않습니다.",
+            )
+        current_history_text = (
+            conversation_history_text(exchange) if exchange.follow_ups else ""
         )
+        try:
+            evaluation = evaluate_answer(
+                questions[question_order_index],
+                exchange.student_answer.strip() or "(답변 없음)",
+                llm=self._eval_llm,
+                conversation_history=current_history_text,
+                follow_up_count=len(exchange.follow_ups),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=_stage_error_detail(
+                    "follow_up_generation",
+                    "AI 꼬리질문 생성 실패: LLM 평가 처리 중 오류가 발생했습니다.",
+                    exc,
+                    llm_model=self.settings.OPENAI_EVAL_MODEL,
+                    question_id=questions[question_order_index].id,
+                ),
+            ) from exc
+        if not evaluation.get("needs_follow_up"):
+            return None
+        follow_up = str(evaluation.get("follow_up_question") or "").strip()
+        if not follow_up:
+            return None
+        return {
+            "question": follow_up,
+            "reason": str(evaluation.get("follow_up_reason") or "").strip(),
+        }
 
     def list_turns(
         self,
@@ -814,6 +920,18 @@ class ProjectEvaluationService:
         self.ensure_session(evaluation_id, session_id, session_token, client_id)
         return self.repository.list_turns(session_id)
 
+    def _conversation_history(self, session_id: str) -> str:
+        turns = self.repository.list_turn_rows(session_id)
+        parts = []
+        for index, turn in enumerate(turns, start=1):
+            parts.append(
+                f"### 이전 턴 {index}\n"
+                f"Q: {turn.question_text}\n"
+                f"A: {turn.answer_text}\n"
+                f"평가 요약: {turn.evaluation_summary}"
+            )
+        return "\n\n".join(parts)
+
     def complete_session(
         self,
         evaluation_id: str,
@@ -823,18 +941,66 @@ class ProjectEvaluationService:
     ) -> EvaluationReportRead:
         session = self.ensure_session(evaluation_id, session_id, session_token, client_id)
         if session.status.value == "completed":
+            existing_report = self.repository.get_latest_report_for_session(session_id)
+            if existing_report is not None:
+                return existing_report
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="이미 완료된 인터뷰입니다.",
             )
         questions = self.repository.list_question_rows(evaluation_id)
         turns = self.repository.list_turn_rows(session_id)
-        if len(turns) < len(questions):
+        if len(turns) != len(questions):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="모든 질문에 답변한 뒤 인터뷰를 완료할 수 있습니다.",
+                detail={
+                    "stage": "report_generation",
+                    "reason": "turn_count_mismatch",
+                    "message": "모든 질문에 정확히 한 번씩 답변한 뒤 인터뷰를 완료할 수 있습니다.",
+                    "question_count": len(questions),
+                    "turn_count": len(turns),
+                },
             )
+
+        questions_by_id = {question.id: question for question in questions}
+        try:
+            for turn in turns:
+                question = questions_by_id.get(turn.question_id)
+                if question is None:
+                    raise RuntimeError(f"최종 채점 대상 질문을 찾을 수 없습니다. question_id={turn.question_id}")
+                exchange = turn.conversation_history or QuestionExchange(
+                    student_answer=turn.answer_text.strip() or "(답변 없음)"
+                )
+                finalized = finalize_oral_evaluation(
+                    question,
+                    turn.answer_text,
+                    llm=self._eval_llm,
+                    conversation_history=conversation_history_text(exchange),
+                )
+                self.repository.update_turn_evaluation(
+                    turn.id,
+                    score=float(finalized["score"]),
+                    evaluation_summary=str(finalized["evaluation_summary"]),
+                    rubric_scores=list(finalized["rubric_scores"]),
+                    evidence_matches=list(finalized["evidence_matches"]),
+                    evidence_mismatches=list(finalized["evidence_mismatches"]),
+                    suspicious_points=list(finalized["suspicious_points"]),
+                    strengths=list(finalized["strengths"]),
+                    finalized_score=float(finalized["score"]),
+                )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=_stage_error_detail(
+                    "answer_finalize",
+                    "AI 최종 채점 실패: finalize rubric 평가 중 오류가 발생했습니다.",
+                    exc,
+                    llm_model=self.settings.OPENAI_EVAL_MODEL,
+                ),
+            ) from exc
+
         areas = self.repository.list_area_rows(evaluation_id)
+        turns = self.repository.list_turn_rows(session_id)
         rubric_scores_by_turn = self.repository.rubric_scores_by_turn([turn.id for turn in turns])
         try:
             report = generate_report_payload(

@@ -4,6 +4,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from services.api.app.project_evaluations.rag.redaction import redact_sensitive_text
@@ -16,6 +17,7 @@ from services.api.app.project_evaluations.domain.models import (
     EvaluationStatus,
     ExtractedProjectContextRead,
     FinalDecision,
+    FollowUpExchange,
     InterviewQuestionRead,
     InterviewSessionRead,
     InterviewSessionStatus,
@@ -24,6 +26,7 @@ from services.api.app.project_evaluations.domain.models import (
     ProjectArtifactRead,
     ProjectEvaluationCreate,
     ProjectEvaluationRead,
+    QuestionExchange,
     QuestionGenerationPolicy,
     RubricCriterion,
     RubricScoreItem,
@@ -56,8 +59,8 @@ def from_json(value: str, default: Any) -> Any:
         return default
     try:
         return json.loads(value)
-    except json.JSONDecodeError:
-        return default
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("저장된 JSON 데이터 파싱에 실패했습니다.") from exc
 
 
 def refs_from_json(value: str) -> list[SourceReference]:
@@ -399,6 +402,9 @@ class ProjectEvaluationRepository:
         suspicious_points: list[str],
         strengths: list[str],
         follow_up_question: str | None,
+        follow_up_reason: str = "",
+        finalized_score: float | None = None,
+        conversation_history: QuestionExchange | None = None,
     ) -> InterviewTurnRead:
         turn = InterviewTurnRow(
             id=new_id(),
@@ -413,8 +419,58 @@ class ProjectEvaluationRepository:
             suspicious_points_json=to_json(suspicious_points),
             strengths_json=to_json(strengths),
             follow_up_question=follow_up_question,
+            follow_up_reason=follow_up_reason,
+            finalized_score=finalized_score,
+            conversation_history_json=to_json(
+                conversation_history.model_dump() if conversation_history else {}
+            ),
         )
-        self.session.add(turn)
+        try:
+            self.session.add(turn)
+            self.session.flush()
+            for item in rubric_scores:
+                self.session.add(
+                    RubricScoreRow(
+                        id=new_id(),
+                        turn_id=turn.id,
+                        criterion=item.criterion.value,
+                        score=item.score,
+                        rationale=item.rationale,
+                    )
+                )
+            session = self.get_session_row(session_id)
+            if session is not None:
+                session.current_question_index += 1
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            raise
+        self.session.refresh(turn)
+        return self.to_turn_read(turn, rubric_scores)
+
+    def update_turn_evaluation(
+        self,
+        turn_id: str,
+        score: float,
+        evaluation_summary: str,
+        rubric_scores: list[RubricScoreItem],
+        evidence_matches: list[str],
+        evidence_mismatches: list[str],
+        suspicious_points: list[str],
+        strengths: list[str],
+        finalized_score: float | None = None,
+    ) -> InterviewTurnRead:
+        turn = self.session.get(InterviewTurnRow, turn_id)
+        if turn is None:
+            raise RuntimeError(f"답변 turn을 찾을 수 없습니다. turn_id={turn_id}")
+        turn.score = score
+        turn.evaluation_summary = evaluation_summary
+        turn.evidence_matches_json = to_json(evidence_matches)
+        turn.evidence_mismatches_json = to_json(evidence_mismatches)
+        turn.suspicious_points_json = to_json(suspicious_points)
+        turn.strengths_json = to_json(strengths)
+        turn.finalized_score = finalized_score
+        self.session.execute(delete(RubricScoreRow).where(RubricScoreRow.turn_id == turn_id))
         self.session.flush()
         for item in rubric_scores:
             self.session.add(
@@ -426,9 +482,6 @@ class ProjectEvaluationRepository:
                     rationale=item.rationale,
                 )
             )
-        session = self.get_session_row(session_id)
-        if session is not None:
-            session.current_question_index += 1
         self.session.commit()
         self.session.refresh(turn)
         return self.to_turn_read(turn, rubric_scores)
@@ -586,6 +639,17 @@ class ProjectEvaluationRepository:
             return None
         return self.to_report_read(row)
 
+    def get_latest_report_for_session(self, session_id: str) -> EvaluationReportRead | None:
+        row = self.session.scalar(
+            select(EvaluationReportRow)
+            .where(EvaluationReportRow.session_id == session_id)
+            .order_by(EvaluationReportRow.created_at.desc())
+            .limit(1)
+        )
+        if row is None:
+            return None
+        return self.to_report_read(row)
+
     def to_evaluation_read(self, row: ProjectEvaluationRow) -> ProjectEvaluationRead:
         return ProjectEvaluationRead(
             id=row.id,
@@ -676,6 +740,17 @@ class ProjectEvaluationRepository:
     def to_turn_read(
         self, row: InterviewTurnRow, rubric_scores: list[RubricScoreItem]
     ) -> InterviewTurnRead:
+        conversation_data = from_json(row.conversation_history_json, {})
+        conversation_history = None
+        if conversation_data:
+            follow_ups = [
+                FollowUpExchange(**item)
+                for item in conversation_data.get("follow_ups", [])
+            ]
+            conversation_history = QuestionExchange(
+                student_answer=str(conversation_data.get("student_answer", "")),
+                follow_ups=follow_ups,
+            )
         return InterviewTurnRead(
             id=row.id,
             session_id=row.session_id,
@@ -690,6 +765,9 @@ class ProjectEvaluationRepository:
             suspicious_points=from_json(row.suspicious_points_json, []),
             strengths=from_json(row.strengths_json, []),
             follow_up_question=row.follow_up_question,
+            follow_up_reason=row.follow_up_reason,
+            finalized_score=row.finalized_score,
+            conversation_history=conversation_history,
             created_at=row.created_at,
         )
 

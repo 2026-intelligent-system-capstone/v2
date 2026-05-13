@@ -56,6 +56,11 @@ def ensure_schema_columns(engine: Engine) -> None:
             "expected_evidence": "TEXT NOT NULL DEFAULT ''",
             "source_ref_requirements": "TEXT NOT NULL DEFAULT ''",
         },
+        "interview_turns": {
+            "follow_up_reason": "TEXT NOT NULL DEFAULT ''",
+            "finalized_score": "FLOAT",
+            "conversation_history_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
     }
     with engine.begin() as connection:
         for table_name, column_defs in columns_by_table.items():
@@ -68,6 +73,13 @@ def ensure_schema_columns(engine: Engine) -> None:
                     connection.execute(
                         text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
                     )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "uq_interview_turn_session_question "
+                "ON interview_turns (session_id, question_id)"
+            )
+        )
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:
