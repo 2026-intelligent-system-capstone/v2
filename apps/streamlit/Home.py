@@ -13,16 +13,17 @@ from apps.streamlit.api_client import (
     create_evaluation,
     extract_evaluation,
     generate_questions,
-    get_api_base_url,
     get_context,
     get_evaluation_status,
     get_health,
     get_latest_report,
     join_evaluation,
     list_questions,
+    list_turns,
     upload_zip,
     verify_admin,
 )
+from apps.streamlit.components.report import render_report
 
 st.set_page_config(page_title="프로젝트 수행 진위 평가", layout="wide")
 
@@ -69,9 +70,22 @@ def calculate_bloom_distribution(
 
 
 def public_student_entry_url(evaluation_id: str) -> str:
-    base_url = os.getenv("PUBLIC_STREAMLIT_BASE_URL", "http://localhost:8501").rstrip("/")
+    base_url = (
+        os.getenv("PUBLIC_APP_BASE_URL")
+        or os.getenv("PUBLIC_STREAMLIT_BASE_URL")
+        or "http://localhost:8501"
+    ).rstrip("/")
     query = urlencode({"mode": "student", "evaluation_id": evaluation_id})
     return f"{base_url}/?{query}"
+
+
+def public_interview_url(path: str) -> str:
+    base_url = (
+        os.getenv("PUBLIC_APP_BASE_URL")
+        or os.getenv("PUBLIC_INTERVIEW_BASE_URL")
+        or "http://localhost:8000"
+    ).rstrip("/")
+    return f"{base_url}{path}"
 
 
 def display_value(value: object) -> str:
@@ -819,7 +833,44 @@ def render_professor() -> None:
                 st.rerun()
 
     if st.session_state.get("report"):
-        render_report(st.session_state["report"])
+        report = st.session_state["report"]
+        if isinstance(report, dict):
+            session_id = str(report.get("session_id", ""))
+            session_token = ""
+            joined = st.session_state.get("joined_session")
+            if isinstance(joined, dict):
+                sess = joined.get("session", {})
+                if isinstance(sess, dict) and str(sess.get("id", "")) == session_id:
+                    session_token = str(sess.get("session_token", ""))
+
+            questions_data, q_err = call_api_capture_error(
+                list_questions, evaluation_id, admin_password
+            )
+            questions_list = questions_data if isinstance(questions_data, list) else None
+
+            turns_list: list | None = None
+            t_err = None
+            t_err_msg = ""
+            if session_id and session_token:
+                turns_data, t_err = call_api_capture_error(
+                    list_turns, evaluation_id, session_id, session_token
+                )
+                turns_list = turns_data if isinstance(turns_data, list) else None
+                if t_err is not None:
+                    t_err_msg = str(t_err)
+            elif session_id and not session_token:
+                t_err_msg = (
+                    "이 화면에서는 학생 세션 토큰을 보유하고 있지 않아 "
+                    "답변 전문/꼬리질문 상세를 불러올 수 없습니다."
+                )
+
+            render_report(
+                report,
+                questions=questions_list,
+                turns=turns_list,
+                questions_error=str(q_err) if q_err is not None else "",
+                turns_error=t_err_msg,
+            )
 
 
 def render_student() -> None:
@@ -845,35 +896,11 @@ def render_student() -> None:
         session = joined.get("session", {})
         evaluation = joined.get("evaluation", {})
         path = str(joined.get("interview_url_path", ""))
-        interview_url = f"{get_api_base_url()}{path}"
+        interview_url = public_interview_url(path)
         st.subheader("음성 프로젝트 인터뷰")
         st.caption(f"방: {evaluation.get('room_name', evaluation.get('project_name', '-'))}")
         st.success(f"세션 준비 완료 · 세션 ID: {session.get('id', '-')}")
         st.link_button("음성 인터뷰 시작", interview_url, type="primary")
-
-
-def render_report(report: dict[str, object]) -> None:
-    st.header("최종 리포트")
-    col1, col2 = st.columns(2)
-    col1.metric("최종 판정", report["final_decision"])
-    col2.metric("신뢰도 점수", report["authenticity_score"])
-    st.subheader("요약")
-    st.write(report["summary"])
-    st.subheader("프로젝트 영역별 신뢰도")
-    st.dataframe(report.get("area_analyses", []), width="stretch")
-    st.subheader("질문별 평가")
-    st.dataframe(report.get("question_evaluations", []), width="stretch")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("강점")
-        st.write(report.get("strengths", []))
-        st.subheader("근거 일치")
-        st.write(report.get("evidence_alignment", []))
-    with col2:
-        st.subheader("의심 지점")
-        st.write(report.get("suspicious_points", []))
-        st.subheader("추가 확인 질문")
-        st.write(report.get("recommended_followups", []))
 
 
 init_state()

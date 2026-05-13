@@ -39,6 +39,7 @@ services:
       - .env
     environment:
       API_BASE_URL: https://dialearn.presso.ac/api
+      PUBLIC_APP_BASE_URL: https://dialearn.presso.ac
     depends_on:
       api:
         condition: service_healthy
