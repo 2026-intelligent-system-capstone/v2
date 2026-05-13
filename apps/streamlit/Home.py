@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from apps.streamlit.api_client import (
     ApiClientError,
     create_evaluation,
+    delete_evaluation,
     extract_evaluation,
     generate_questions,
     get_api_base_url,
@@ -19,6 +20,7 @@ from apps.streamlit.api_client import (
     get_health,
     get_latest_report,
     join_evaluation,
+    list_evaluations,
     list_questions,
     upload_zip,
     verify_admin,
@@ -90,11 +92,17 @@ def query_param_value(name: str) -> str:
 
 
 def init_state() -> None:
-    initial_mode = "student" if query_param_value("mode") == "student" else "home"
+    url_mode = query_param_value("mode")
+    if url_mode in ("professor", "student"):
+        initial_mode = url_mode
+    else:
+        initial_mode = "home"
+    url_evaluation_id = query_param_value("evaluation_id")
+    initial_evaluation = {"id": url_evaluation_id} if url_evaluation_id and initial_mode == "professor" else None
     defaults = {
         "mode": initial_mode,
-        "step": "join" if initial_mode == "student" else "manage",
-        "evaluation": None,
+        "step": "manage" if initial_mode == "professor" else ("join" if initial_mode == "student" else "manage"),
+        "evaluation": initial_evaluation,
         "admin_verified": False,
         "admin_password": "",
         "upload_result": None,
@@ -236,6 +244,10 @@ def set_mode(mode: str) -> None:
     st.session_state["admin_password"] = ""
     st.session_state["joined_session"] = None
     st.session_state["report"] = None
+    if mode == "home":
+        st.query_params.clear()
+    else:
+        st.query_params["mode"] = mode
     st.rerun()
 
 
@@ -645,15 +657,35 @@ def render_professor() -> None:
                             st.session_state["upload_result"] = upload_result
                             st.session_state["admin_verified"] = True
                             st.session_state["admin_password"] = admin_password
+                            st.query_params["evaluation_id"] = str(evaluation["id"])
                             refresh_professor_state(str(evaluation["id"]), admin_password)
                             st.success(f"방 생성 완료 · 평가 ID: {evaluation['id']}")
                             st.rerun()
 
     with manage_tab:
+        st.subheader("기존 방 목록")
+        evaluations = fetch_api(list_evaluations) or []
+        if not evaluations:
+            st.caption("생성된 방이 없습니다.")
+        else:
+            for ev in evaluations:
+                ev_id = str(ev.get("id", ""))
+                ev_name = str(ev.get("room_name") or ev.get("project_name") or ev_id)
+                ev_time = str(ev.get("created_at", ""))[:16].replace("T", " ")
+                col_a, col_b, col_c = st.columns([3, 2, 1])
+                col_a.write(f"**{ev_name}**")
+                col_b.caption(ev_time)
+                if col_c.button("선택", key=f"sel_{ev_id}"):
+                    st.session_state["prefill_evaluation_id"] = ev_id
+
+        st.divider()
+        prefill_id = st.session_state.pop("prefill_evaluation_id", "") if "prefill_evaluation_id" in st.session_state else ""
         with st.form("admin_verify_form"):
-            evaluation_id = st.text_input("평가/방 ID")
+            evaluation_id = st.text_input("평가/방 ID", value=prefill_id)
             admin_password = st.text_input("관리자 비밀번호", type="password", key="admin_verify_password")
-            submitted = st.form_submit_button("관리자 확인")
+            col1, col2 = st.columns(2)
+            submitted = col1.form_submit_button("관리자 확인", type="primary")
+            delete_submitted = col2.form_submit_button("이 방 삭제", type="secondary")
         if submitted:
             if not evaluation_id or not admin_password:
                 st.warning("평가 ID와 관리자 비밀번호를 입력하세요.")
@@ -664,8 +696,17 @@ def render_professor() -> None:
                     st.session_state["evaluation"] = {"id": evaluation_id}
                     st.session_state["admin_verified"] = True
                     st.session_state["admin_password"] = admin_password
+                    st.query_params["evaluation_id"] = evaluation_id
                     refresh_professor_state(evaluation_id, admin_password)
                     st.success("관리자 확인 완료")
+                    st.rerun()
+        if delete_submitted:
+            if not evaluation_id or not admin_password:
+                st.warning("삭제할 평가 ID와 관리자 비밀번호를 입력하세요.")
+            else:
+                deleted = call_api(delete_evaluation, evaluation_id, admin_password)
+                if deleted is not None:
+                    st.success("방이 삭제되었습니다.")
                     st.rerun()
 
     if not st.session_state.get("admin_verified") or not st.session_state.get("evaluation"):
@@ -679,11 +720,10 @@ def render_professor() -> None:
     st.divider()
     st.subheader("방 관리")
     st.success("방 생성과 zip 업로드가 완료되었습니다." if upload_result else "관리자 확인이 완료되었습니다.")
-    col1, col2 = st.columns([1, 2])
-    col1.metric("평가 ID", evaluation_id)
-    with col2:
-        st.markdown("**학생 입장 URL 전체**")
-        st.code(student_url, language=None)
+    st.markdown("**평가 ID**")
+    st.code(evaluation_id, language=None)
+    st.markdown("**학생 입장 URL 전체**")
+    st.code(student_url, language=None)
     st.info(
         "학생에게 위 학생 입장 URL, 평가 ID, 방 비밀번호를 함께 전달하세요. "
         "학생은 공용 입장 화면에서 평가 ID와 방 비밀번호로 로그인 없이 입장합니다."
@@ -846,14 +886,15 @@ def render_student() -> None:
         evaluation = joined.get("evaluation", {})
         path = str(joined.get("interview_url_path", ""))
         interview_url = f"{get_api_base_url()}{path}"
-        st.subheader("단계형 프로젝트 인터뷰")
+        st.subheader("프로젝트 인터뷰")
         st.caption(f"방: {evaluation.get('room_name', evaluation.get('project_name', '-'))}")
         st.success(f"세션 준비 완료 · 세션 ID: {session.get('id', '-')}")
         session_token = str(session.get("session_token", ""))
-        if session_token:
-            st.code(session_token, language=None)
-        st.info("아래 버튼을 클릭한 뒤 표시된 세션 토큰을 한 번 입력하면 단계형 인터뷰가 시작됩니다.")
-        st.link_button("단계형 인터뷰 시작", interview_url, type="primary")
+        token_query = f"?token={session_token}" if session_token else ""
+        voice_url = f"{interview_url}{token_query}&mode=voice" if token_query else f"{interview_url}?mode=voice"
+        text_url = f"{interview_url}{token_query}&mode=text" if token_query else f"{interview_url}?mode=text"
+        st.link_button("음성 인터뷰 시작", voice_url, type="primary")
+        st.link_button("텍스트 인터뷰", text_url)
 
 
 def render_report(report: dict[str, object]) -> None:

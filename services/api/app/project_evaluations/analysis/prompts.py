@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from services.api.app.project_evaluations.domain.models import (
     BLOOM_ORDER,
@@ -129,14 +129,53 @@ class FinalizeAnswerSchema(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0, description="평가 신뢰도")
 
 
+class AreaAnalysisItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    area: str
+    verdict: str
+    rationale: str
+    suspicious_points: list[str] = Field(default_factory=list)
+    recommended_followups: list[str] = Field(default_factory=list)
+
+
+class QuestionEvaluationItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    question_id: str
+    question: str
+    bloom_level: str
+    score: float
+    summary: str
+    area: str
+    source_refs: list[str] = Field(default_factory=list)
+    evidence_matches: list[str] = Field(default_factory=list)
+    evidence_mismatches: list[str] = Field(default_factory=list)
+    suspicious_points: list[str] = Field(default_factory=list)
+    needs_follow_up: bool = False
+
+
+class BloomSummaryItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    bloom_level: str
+    question_count: int
+    average_score: float
+
+
+class RubricSummaryItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    criterion: str
+    average_score: float
+    question_count: int
+
+
 class ReportSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     final_decision: str = Field(description="검증 통과|추가 확인 필요|신뢰 낮음")
     authenticity_score: float = Field(ge=0.0, le=100.0)
     summary: str = Field(description="최종 종합 판단 3~5문장")
-    area_analyses: list[dict[str, Any]] = Field(default_factory=list)
-    question_evaluations: list[dict[str, Any]] = Field(default_factory=list)
-    bloom_summary: dict[str, Any] = Field(default_factory=dict)
-    rubric_summary: dict[str, Any] = Field(default_factory=dict)
+    area_analyses: list[AreaAnalysisItem] = Field(default_factory=list)
+    question_evaluations: list[QuestionEvaluationItem] = Field(default_factory=list)
+    bloom_summary: list[BloomSummaryItem] = Field(default_factory=list)
+    rubric_summary: list[RubricSummaryItem] = Field(default_factory=list)
     evidence_alignment: list[str] = Field(default_factory=list)
     strengths: list[str] = Field(default_factory=list)
     suspicious_points: list[str] = Field(default_factory=list)

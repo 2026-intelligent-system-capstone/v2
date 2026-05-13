@@ -110,6 +110,12 @@ class ProjectEvaluationRepository:
         self.session.refresh(row)
         return self.to_evaluation_read(row)
 
+    def list_evaluation_rows(self) -> list[ProjectEvaluationRow]:
+        return list(self.session.execute(select(ProjectEvaluationRow)).scalars().all())
+
+    def list_evaluations(self) -> list[ProjectEvaluationRead]:
+        return [self.to_evaluation_read(row) for row in self.list_evaluation_rows()]
+
     def get_evaluation_row(self, evaluation_id: str) -> ProjectEvaluationRow | None:
         return self.session.get(ProjectEvaluationRow, evaluation_id)
 

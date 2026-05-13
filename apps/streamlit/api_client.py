@@ -130,6 +130,22 @@ def create_evaluation(
     )
 
 
+def list_evaluations() -> list[dict[str, object]]:
+    return request_json_list("GET", "/api/project-evaluations")
+
+
+def delete_evaluation(evaluation_id: str, admin_password: str) -> None:
+    url = f"{get_api_base_url()}/api/project-evaluations/{evaluation_id}"
+    try:
+        response = requests.delete(url, headers={"x-admin-password": admin_password}, timeout=30)
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = _error_detail(exc.response) if exc.response is not None else str(exc)
+        raise ApiClientError(f"방 삭제에 실패했습니다.", detail=detail) from exc
+    except requests.RequestException as exc:
+        raise ApiClientError(f"FastAPI 서버 요청에 실패했습니다. 요청=DELETE {url}") from exc
+
+
 def verify_admin(evaluation_id: str, admin_password: str) -> dict[str, object]:
     return request_json_dict(
         "POST",

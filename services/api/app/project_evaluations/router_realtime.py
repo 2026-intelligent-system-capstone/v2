@@ -120,7 +120,14 @@ const parts = location.pathname.split('/');
 const EVAL_ID = parts[2];
 const SESSION_ID = parts[3];
 const API_BASE = `/api/project-evaluations/${EVAL_ID}/sessions/${SESSION_ID}/interview`;
-document.getElementById('voice-link').href = `/interview/${EVAL_ID}/${SESSION_ID}/voice`;
+
+function _getCookie(name) {
+  const v = `; ${document.cookie}`;
+  const p = v.split(`; ${name}=`);
+  return p.length === 2 ? p.pop().split(';').shift() : '';
+}
+const _stToken = _getCookie(`interview_session_${SESSION_ID}`);
+document.getElementById('voice-link').href = `/interview/${EVAL_ID}/${SESSION_ID}/voice` + (_stToken ? `?token=${encodeURIComponent(_stToken)}` : '');
 
 let currentMode = 'answer';
 let currentQuestionId = null;
@@ -425,6 +432,10 @@ body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', system-ui, 
 h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; margin-bottom: 4px; }
 .subtitle { font-size: .85rem; color: #64748b; margin-bottom: 24px; }
 #main { width: 100%; max-width: 800px; display: flex; flex-direction: column; gap: 16px; }
+#start-overlay { width: 100%; max-width: 800px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; padding: 60px 24px; background: #1e293b; border-radius: 16px; }
+#start-overlay p { font-size: .95rem; color: #94a3b8; text-align: center; line-height: 1.6; }
+#start-btn { padding: 14px 40px; background: #2563eb; color: #fff; border: none; border-radius: 10px; font-size: 1.05rem; font-weight: 700; cursor: pointer; transition: background .15s; }
+#start-btn:hover { background: #1d4ed8; }
 #status-bar { display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: #1e293b; border-radius: 10px; }
 #status-dot { width: 12px; height: 12px; border-radius: 50%; background: #64748b; flex-shrink: 0; transition: background .3s; }
 #status-dot.connecting { background: #fbbf24; animation: pulse 1s infinite; }
@@ -453,6 +464,10 @@ h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; margin-bottom: 4px; }
 #end-btn { padding: 10px 24px; background: #dc2626; color: #fff; border: none; border-radius: 8px; font-size: .9rem; font-weight: 600; cursor: pointer; transition: background .2s; }
 #end-btn:hover { background: #b91c1c; }
 #end-btn:disabled { background: #374151; cursor: default; color: #6b7280; }
+#ptt-btn { padding: 14px 32px; background: #16a34a; color: #fff; border: none; border-radius: 10px; font-size: 1rem; font-weight: 700; cursor: pointer; transition: background .15s, transform .1s; display: none; user-select: none; }
+#ptt-btn:hover:not(:disabled) { background: #15803d; }
+#ptt-btn.recording { background: #dc2626; transform: scale(1.05); }
+#ptt-btn:disabled { background: #374151; cursor: default; color: #6b7280; }
 .info-bar { padding: 10px 16px; background: #1e3a5f; border-radius: 8px; font-size: .85rem; color: #93c5fd; display: none; }
 #report-view { width: 100%; max-width: 800px; display: none; flex-direction: column; gap: 20px; }
 .report-header { padding: 24px; background: #1e293b; border-radius: 14px; text-align: center; }
@@ -483,7 +498,12 @@ ul.bullet li { font-size: .88rem; color: #cbd5e1; line-height: 1.5; }
 <h1>음성 보조 인터뷰</h1>
 <p class="subtitle">평가 진행과 결정은 텍스트 단계형 core가 담당하고, 이 화면은 음성 입출력 보조 역할입니다. 음성 transport가 실패하면 <a href="#" id="staged-link">단계형 화면</a>에서 그대로 이어 갈 수 있습니다.</p>
 
-<div id="main">
+<div id="start-overlay">
+  <p>마이크 권한이 필요합니다.<br>아래 버튼을 눌러 음성 인터뷰를 시작하세요.</p>
+  <button id="start-btn">🎙 음성 인터뷰 시작</button>
+</div>
+
+<div id="main" style="display:none">
   <div id="status-bar">
     <div id="status-dot" class="connecting"></div>
     <span id="status-text">실시간 인터뷰를 연결하는 중...</span>
@@ -499,6 +519,7 @@ ul.bullet li { font-size: .88rem; color: #cbd5e1; line-height: 1.5; }
   <div id="controls">
     <a class="notice" href="#" id="back-link">← 단계형 화면으로 돌아가기</a>
     <div class="right">
+      <button id="ptt-btn" disabled>🎤 말하기</button>
       <button id="end-btn" disabled>인터뷰 종료</button>
     </div>
   </div>
@@ -510,8 +531,17 @@ ul.bullet li { font-size: .88rem; color: #cbd5e1; line-height: 1.5; }
 const parts = location.pathname.split('/');
 const EVAL_ID = parts[2];
 const SESSION_ID = parts[3];
-const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/project-evaluations/ws/interview/${EVAL_ID}/${SESSION_ID}`;
 const STAGED_URL = `/interview/${EVAL_ID}/${SESSION_ID}`;
+
+function _getCookie(name) {
+  const v = `; ${document.cookie}`;
+  const p = v.split(`; ${name}=`);
+  return p.length === 2 ? p.pop().split(';').shift() : '';
+}
+const _urlToken = new URLSearchParams(location.search).get('token') || '';
+const _cookieToken = _getCookie(`interview_session_${SESSION_ID}`);
+const _sessionToken = _cookieToken || _urlToken;
+const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/project-evaluations/ws/interview/${EVAL_ID}/${SESSION_ID}` + (_sessionToken ? `?token=${encodeURIComponent(_sessionToken)}` : '');
 document.getElementById('staged-link').href = STAGED_URL;
 document.getElementById('back-link').href = STAGED_URL;
 
@@ -764,12 +794,44 @@ function endInterview() {
   socket.send(JSON.stringify({ type: 'interview.end' }));
 }
 
+let pttRecording = false;
+function setupPtt() {
+  const btn = document.getElementById('ptt-btn');
+  function startRecording() {
+    if (!socket || socket.readyState !== WebSocket.OPEN || pttRecording) return;
+    pttRecording = true;
+    captureEnabled = true;
+    btn.classList.add('recording');
+    btn.textContent = '🔴 녹음 중... (다시 누르면 전송)';
+    setStatus('user-speaking', '말씀해 주세요...');
+  }
+  function stopRecording() {
+    if (!pttRecording) return;
+    pttRecording = false;
+    captureEnabled = false;
+    btn.classList.remove('recording');
+    btn.textContent = '🎤 말하기';
+    btn.disabled = true;
+    btn.style.display = 'none';
+    setStatus('evaluating', '답변을 처리 중...');
+    socket.send(JSON.stringify({ type: 'ptt.commit' }));
+  }
+  btn.addEventListener('click', () => {
+    if (pttRecording) {
+      stopRecording();
+    } else {
+      startRecording();
+    }
+  });
+}
+
 function connectSocket() {
   return new Promise((resolve, reject) => {
     socket = new WebSocket(WS_URL);
     socket.binaryType = 'arraybuffer';
 
     socket.onopen = () => {
+      console.log('[socket] onopen');
       document.getElementById('end-btn').disabled = false;
       setStatus('ready', '실시간 인터뷰 연결 완료');
       resolve();
@@ -777,11 +839,14 @@ function connectSocket() {
 
     socket.onmessage = async (event) => {
       if (typeof event.data !== 'string') {
+        console.log('[socket] binary audio', event.data.byteLength, 'bytes');
         playPcm16(event.data);
         return;
       }
       const message = JSON.parse(event.data);
+      console.log('[socket] message', message.type);
       if (message.type === 'prompt.queued') {
+        captureEnabled = false;
         setLiveCaption(message.text || '');
         setStatus('ai-speaking', '인터뷰어가 말하는 중...');
         return;
@@ -791,20 +856,29 @@ function connectSocket() {
         return;
       }
       if (message.type === 'input.open') {
-        captureEnabled = true;
-        if (message.mode === 'identity') {
-          showInfo('본인 확인 답변을 말씀해 주세요.');
-          setStatus('ready', '학번과 이름을 말씀해 주세요');
-        } else if (message.mode === 'follow_up') {
-          showInfo('꼬리질문에 답변해 주세요.');
-          setStatus('ready', '꼬리질문에 답변해 주세요');
-        } else if (message.mode === 'more') {
-          showInfo('추가 답변을 말씀해 주세요.');
-          setStatus('ready', '추가 답변을 말씀해 주세요');
-        } else {
-          showInfo('답변을 말씀해 주세요.');
-          setStatus('ready', '답변을 말씀해 주세요');
+        const mode = message.mode;
+        function showPtt() {
+          const pttBtn = document.getElementById('ptt-btn');
+          pttBtn.style.display = 'block';
+          pttBtn.disabled = false;
+          if (mode === 'identity') {
+            showInfo('🎤 말하기 버튼을 눌러 학번과 이름을 말씀해 주세요.');
+            setStatus('ready', '말하기 버튼을 눌러주세요');
+          } else if (mode === 'follow_up') {
+            showInfo('🎤 말하기 버튼을 눌러 꼬리질문에 답변해 주세요.');
+            setStatus('ready', '말하기 버튼을 눌러주세요');
+          } else if (mode === 'more') {
+            showInfo('🎤 추가로 말씀하실 내용이 있으면 말하기 버튼을 눌러주세요.');
+            setStatus('ready', '말하기 버튼을 눌러주세요');
+          } else {
+            showInfo('🎤 말하기 버튼을 눌러 답변해 주세요.');
+            setStatus('ready', '말하기 버튼을 눌러주세요');
+          }
         }
+        const delay = audioContext && playheadTime > audioContext.currentTime
+          ? Math.max(0, (playheadTime - audioContext.currentTime) * 1000) + 300
+          : 300;
+        setTimeout(showPtt, delay);
         return;
       }
       if (message.type === 'transcript.user') {
@@ -841,11 +915,13 @@ function connectSocket() {
       }
     };
 
-    socket.onerror = () => {
+    socket.onerror = (e) => {
+      console.error('[socket] onerror', e);
       reject(new Error('실시간 인터뷰 WebSocket 연결에 실패했습니다.'));
     };
 
-    socket.onclose = () => {
+    socket.onclose = (e) => {
+      console.log('[socket] onclose', e.code, e.reason);
       captureEnabled = false;
       if (!isRenderingReport) {
         document.getElementById('end-btn').disabled = true;
@@ -855,13 +931,21 @@ function connectSocket() {
 }
 
 async function bootstrap() {
+  console.log('[bootstrap] start');
+  document.getElementById('start-overlay').style.display = 'none';
+  document.getElementById('main').style.display = 'flex';
   setStatus('connecting', '실시간 인터뷰를 준비하는 중...');
   document.getElementById('end-btn').addEventListener('click', endInterview);
+  setupPtt();
   try {
+    console.log('[bootstrap] setupAudio start');
     await setupAudio();
+    console.log('[bootstrap] setupAudio done, connectSocket start');
     await connectSocket();
+    console.log('[bootstrap] connectSocket done');
     showInfo('마이크가 연결되었습니다. 인터뷰어의 안내를 기다려 주세요.');
   } catch (error) {
+    console.error('[bootstrap] error', error);
     cleanupAudio();
     addMsg('system', '오류', error.message || String(error));
     setStatus('error', '음성 보조 시작 실패. 단계형 화면에서 계속 진행하세요.');
@@ -873,7 +957,7 @@ window.addEventListener('beforeunload', () => {
   cleanupAudio();
 });
 
-bootstrap();
+document.getElementById('start-btn').addEventListener('click', bootstrap);
 </script>
 </body>
 </html>
@@ -883,9 +967,40 @@ bootstrap();
 _HTML = _VOICE_HTML
 
 
-@router.get("/interview/{evaluation_id}/{session_id}/open", response_class=HTMLResponse)
-async def open_interview_page(evaluation_id: str, session_id: str) -> str:
-    return (
+@router.get("/interview/{evaluation_id}/{session_id}/open", response_class=HTMLResponse, response_model=None)
+async def open_interview_page(
+    request: Request,
+    evaluation_id: str,
+    session_id: str,
+    token: str | None = None,
+    mode: str = "voice",
+) -> HTMLResponse | RedirectResponse:
+    if token:
+        settings = request.app.state.settings
+        session_factory = request.app.state.session_factory
+        client_id = request.client.host if request.client else "local"
+        with session_factory() as db_session:
+            service = ProjectEvaluationService(
+                ProjectEvaluationRepository(db_session),
+                settings,
+            )
+            service.ensure_session(evaluation_id, session_id, token, client_id)
+        redirect_path = (
+            f"/interview/{evaluation_id}/{session_id}"
+            if mode == "text"
+            else f"/interview/{evaluation_id}/{session_id}/voice"
+        )
+        response = RedirectResponse(redirect_path, status_code=303)
+        response.set_cookie(
+            key=f"interview_session_{session_id}",
+            value=token,
+            httponly=False,
+            samesite="lax",
+            max_age=60 * 60 * 2,
+            secure=request.url.scheme == "https",
+        )
+        return response
+    return HTMLResponse(
         "<!DOCTYPE html><html lang='ko'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<title>인터뷰 입장</title></head><body>"
@@ -918,8 +1033,8 @@ async def set_interview_cookie(
     response.set_cookie(
         key=f"interview_session_{session_id}",
         value=session_token,
-        httponly=True,
-        samesite="strict",
+        httponly=False,
+        samesite="lax",
         max_age=60 * 60 * 2,
         secure=request.url.scheme == "https",
     )

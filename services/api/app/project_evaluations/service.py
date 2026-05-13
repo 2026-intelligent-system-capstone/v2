@@ -23,6 +23,7 @@ from services.api.app.project_evaluations.domain.models import (
     EvaluationReportRead,
     EvaluationStatus,
     ExtractedProjectContextRead,
+    FollowUpExchange,
     InterviewQuestionRead,
     InterviewSessionRead,
     InterviewTurnCreate,
@@ -184,6 +185,9 @@ class ProjectEvaluationService:
             room_password_hash=_hash_password(payload.room_password),
             admin_password_hash=_hash_password(payload.admin_password),
         )
+
+    def list_evaluations(self) -> list[ProjectEvaluationRead]:
+        return self.repository.list_evaluations()
 
     def get_evaluation(self, evaluation_id: str) -> ProjectEvaluationRead:
         evaluation = self.repository.get_evaluation(evaluation_id)
@@ -968,9 +972,19 @@ class ProjectEvaluationService:
                 question = questions_by_id.get(turn.question_id)
                 if question is None:
                     raise RuntimeError(f"최종 채점 대상 질문을 찾을 수 없습니다. question_id={turn.question_id}")
-                exchange = turn.conversation_history or QuestionExchange(
-                    student_answer=turn.answer_text.strip() or "(답변 없음)"
-                )
+                _history_data = from_json(turn.conversation_history_json, {})
+                if _history_data:
+                    exchange = QuestionExchange(
+                        student_answer=str(_history_data.get("student_answer", "")),
+                        follow_ups=[
+                            FollowUpExchange(**item)
+                            for item in _history_data.get("follow_ups", [])
+                        ],
+                    )
+                else:
+                    exchange = QuestionExchange(
+                        student_answer=turn.answer_text.strip() or "(답변 없음)"
+                    )
                 finalized = finalize_oral_evaluation(
                     question,
                     turn.answer_text,

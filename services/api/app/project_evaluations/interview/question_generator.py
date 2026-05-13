@@ -26,8 +26,8 @@ from services.api.app.project_evaluations.rag.context_pack import build_question
 
 BLOOM_SEQUENCE = BLOOM_ORDER
 BLOOM_MAP = {level.value: level for level in BLOOM_SEQUENCE} | {"창조": BloomLevel.CREATE}
-QUESTION_GENERATION_BASE_TOKENS = 10000
-QUESTION_GENERATION_TOKENS_PER_QUESTION = 10000
+QUESTION_GENERATION_BASE_TOKENS = 4000
+QUESTION_GENERATION_TOKENS_PER_QUESTION = 1500
 
 
 def generate_questions(
@@ -99,9 +99,13 @@ def _generate_with_llm(
     expected_counts = Counter(level.value for level in sequence)
     actual_counts = Counter(bloom.value for _q, bloom in parsed_questions)
     if actual_counts != expected_counts:
-        raise RuntimeError(
-            f"LLM 질문 분포가 요청 정책과 다릅니다. expected={dict(expected_counts)}, actual={dict(actual_counts)}"
-        )
+        if sum(actual_counts.values()) == len(sequence):
+            # LLM returned correct count but wrong bloom distribution — remap in order
+            parsed_questions = [(q, bloom) for (q, _), bloom in zip(parsed_questions, sequence)]
+        else:
+            raise RuntimeError(
+                f"LLM 질문 분포가 요청 정책과 다릅니다. expected={dict(expected_counts)}, actual={dict(actual_counts)}"
+            )
 
     buckets: dict[BloomLevel, list] = {level: [] for level in BLOOM_SEQUENCE}
     for q, bloom in parsed_questions:

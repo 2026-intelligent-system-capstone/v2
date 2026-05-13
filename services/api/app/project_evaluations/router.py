@@ -95,12 +95,29 @@ def get_service(
     )
 
 
+@router.get("", response_model=list[ProjectEvaluationRead])
+def list_evaluations(
+    service: Annotated[ProjectEvaluationService, Depends(get_service)],
+) -> list[ProjectEvaluationRead]:
+    return service.list_evaluations()
+
+
 @router.post("", response_model=ProjectEvaluationRead)
 def create_evaluation(
     payload: ProjectEvaluationCreate,
     service: Annotated[ProjectEvaluationService, Depends(get_service)],
 ) -> ProjectEvaluationRead:
     return service.create_evaluation(payload)
+
+
+@router.delete("/{evaluation_id}", status_code=204)
+def delete_evaluation(
+    evaluation_id: str,
+    service: Annotated[ProjectEvaluationService, Depends(get_service)],
+    request_client_id: Annotated[str, Depends(client_id)],
+    x_admin_password: Annotated[str | None, Header()] = None,
+) -> None:
+    service.delete_evaluation(evaluation_id, x_admin_password, request_client_id)
 
 
 @router.get("/{evaluation_id}", response_model=ProjectEvaluationRead)
@@ -353,8 +370,10 @@ async def realtime_interview_websocket(
 ) -> None:
     session_factory = websocket.app.state.session_factory
     settings = websocket.app.state.settings
-    session_token = websocket.cookies.get(f"interview_session_{session_id}") or websocket.headers.get(
-        "x-session-token"
+    session_token = (
+        websocket.cookies.get(f"interview_session_{session_id}")
+        or websocket.headers.get("x-session-token")
+        or websocket.query_params.get("token")
     )
     client_host = websocket.client.host if websocket.client else "local"
 

@@ -7,7 +7,7 @@ class ApiSettings(BaseSettings):
     OPENAI_ANALYSIS_MODEL: str = "gpt-4o-mini"
     OPENAI_QUESTION_MODEL: str = "gpt-4o-mini"
     OPENAI_EVAL_MODEL: str = "gpt-4o-mini"
-    OPENAI_REALTIME_MODEL: str = "gpt-realtime-1.5"
+    OPENAI_REALTIME_MODEL: str = "gpt-4o-realtime-preview"
     OPENAI_TRANSCRIBE_MODEL: str = "gpt-4o-transcribe"
     OPENAI_TRANSCRIBE_LANGUAGE: str = "ko"
     OPENAI_AUDIO_MAX_UPLOAD_MB: int = 25

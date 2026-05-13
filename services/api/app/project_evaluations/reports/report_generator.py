@@ -149,10 +149,16 @@ def generate_report_payload(
         "final_decision": decision,
         "authenticity_score": result.authenticity_score,
         "summary": result.summary,
-        "area_analyses": result.area_analyses,
-        "question_evaluations": result.question_evaluations,
-        "bloom_summary": result.bloom_summary,
-        "rubric_summary": result.rubric_summary,
+        "area_analyses": [item.model_dump() for item in result.area_analyses],
+        "question_evaluations": [item.model_dump() for item in result.question_evaluations],
+        "bloom_summary": {
+            item.bloom_level: {"question_count": item.question_count, "average_score": item.average_score}
+            for item in result.bloom_summary
+        },
+        "rubric_summary": {
+            item.criterion: {"average_score": item.average_score, "question_count": item.question_count}
+            for item in result.rubric_summary
+        },
         "evidence_alignment": result.evidence_alignment,
         "strengths": result.strengths,
         "suspicious_points": result.suspicious_points,

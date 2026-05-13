@@ -138,6 +138,7 @@ class InterviewTurnFlow:
                 client_id,
                 "현재 질문을 건너뛰었습니다.",
                 conversation_history=QuestionExchange(student_answer=SKIP_ANSWER_TEXT),
+                allow_follow_up_required=True,
             )
         if intent == StudentIntent.END_EXAM:
             return self._complete_remaining(
@@ -195,6 +196,7 @@ class InterviewTurnFlow:
                 session_token,
                 client_id,
                 "현재 질문 답변을 확정했습니다.",
+                allow_follow_up_required=True,
                 conversation_history=QuestionExchange(
                     student_answer=payload.draft_answer.strip() or SKIP_ANSWER_TEXT
                 ),
@@ -207,6 +209,7 @@ class InterviewTurnFlow:
                 session_token,
                 client_id,
                 "추가 답변 없음으로 현재 질문 답변을 저장했습니다.",
+                allow_follow_up_required=True,
                 conversation_history=QuestionExchange(
                     student_answer=payload.draft_answer.strip() or UNANSWERED_TEXT
                 ),

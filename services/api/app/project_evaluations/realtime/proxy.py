@@ -152,6 +152,7 @@ async def run_realtime_session(
 
     oai_ws_headers = {
         "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
     }
 
     try:
@@ -230,28 +231,16 @@ def _session_update_payload(instructions: str, model: str) -> dict[str, object]:
     return {
         "type": "session.update",
         "session": {
-            "type": "realtime",
-            "model": model,
+            "modalities": ["text", "audio"],
             "instructions": instructions,
-            "audio": {
-                "input": {
-                    "format": {"type": "audio/pcm", "rate": 24000},
-                    "noise_reduction": {"type": "near_field"},
-                    "transcription": {
-                        "model": DEFAULT_TRANSCRIBE_MODEL,
-                        "language": DEFAULT_LANGUAGE,
-                    },
-                    "turn_detection": {
-                        "type": "semantic_vad",
-                        "eagerness": "low",
-                        "create_response": False,
-                    },
-                },
-                "output": {
-                    "format": {"type": "audio/pcm", "rate": 24000},
-                    "voice": "coral",
-                },
+            "voice": "coral",
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "input_audio_transcription": {
+                "model": "whisper-1",
+                "language": DEFAULT_LANGUAGE,
             },
+            "turn_detection": None,
         },
     }
 
@@ -308,7 +297,7 @@ async def _create_audio_response(oai_ws: Any, instructions: str) -> None:
         json.dumps(
             {
                 "type": "response.create",
-                "response": {"output_modalities": ["audio"]},
+                "response": {"modalities": ["audio", "text"]},
             }
         )
     )
@@ -319,9 +308,13 @@ async def _apply_controller_action(
     oai_ws: Any,
     action: RealtimeControllerAction,
 ) -> None:
+    has_input_open = any(m.get("type") == "input.open" for m in action.browser_messages)
+    if has_input_open:
+        await oai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
     for message in action.browser_messages:
         await browser_ws.send_json(message)
     if action.prompt_text:
+        await oai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
         await browser_ws.send_json({"type": "prompt.queued", "text": action.prompt_text})
         await _create_audio_response(oai_ws, action.prompt_text)
 
@@ -546,7 +539,11 @@ async def _browser_to_oai(
                     realtime_failed.set()
                 interview_ended.set()
                 return
-            if data.get("type") != "interview.end":
+            msg_type = data.get("type")
+            if msg_type == "ptt.commit":
+                await oai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                continue
+            if msg_type != "interview.end":
                 continue
             if transition_lock is None:
                 transition_lock = asyncio.Lock()
@@ -621,13 +618,13 @@ async def _oai_to_browser(
             event = json.loads(raw_msg)
             event_type = str(event.get("type") or "")
 
-            if event_type == "response.output_audio.delta":
+            if event_type in ("response.audio.delta", "response.output_audio.delta"):
                 delta = event.get("delta", "")
                 if delta:
                     await browser_ws.send_bytes(base64.b64decode(delta))
                 continue
 
-            if event_type == "response.output_audio.done":
+            if event_type in ("response.audio.done", "response.output_audio.done"):
                 # 브라우저 측 UI 호환을 위해 메시지 이름은 `response.audio.done` 유지.
                 await browser_ws.send_json({"type": "response.audio.done"})
                 async with transition_lock:
@@ -635,13 +632,22 @@ async def _oai_to_browser(
                     action = controller.handle_playback_done()
                     await _apply_controller_action(browser_ws, oai_ws, action)
                     if was_closing and complete_interview is not None:
-                        report = await asyncio.to_thread(complete_interview)
-                        await browser_ws.send_json(
-                            {
-                                "type": "interview.complete",
-                                "report": _report_payload(report),
-                            }
-                        )
+                        try:
+                            report = await asyncio.to_thread(complete_interview)
+                            await browser_ws.send_json(
+                                {
+                                    "type": "interview.complete",
+                                    "report": _report_payload(report),
+                                }
+                            )
+                        except Exception as exc:
+                            logger.error("complete_interview failed: %s", exc, exc_info=True)
+                            await browser_ws.send_json(
+                                {
+                                    "type": "error",
+                                    "message": "리포트 생성 중 오류가 발생했습니다. 단계형 화면에서 리포트를 확인하세요.",
+                                }
+                            )
                         interview_ended.set()
                         return
                     if (
