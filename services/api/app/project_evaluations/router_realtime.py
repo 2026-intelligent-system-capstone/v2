@@ -10,17 +10,102 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Form, HTTPException, Request, status
+from fastapi import APIRouter, Form, HTTPException, Request, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
+from openai import AsyncOpenAI
 
 from services.api.app.project_evaluations.persistence.repository import (
     ProjectEvaluationRepository,
 )
 from services.api.app.project_evaluations.service import ProjectEvaluationService
+from services.api.app.project_evaluations.interview.turn_flow import InterviewTurnFlow
+from services.api.app.project_evaluations.domain.models import InterviewTurnFlowRequest
 
 router = APIRouter(tags=["realtime-interview"])
+
+logger = logging.getLogger(__name__)
+
+
+@router.websocket("/interview/{evaluation_id}/{session_id}/ws")
+async def interview_websocket(
+    websocket: WebSocket,
+    evaluation_id: str,
+    session_id: str,
+):
+    """표준 OpenAI Chat API를 활용한 텍스트 전용 인터뷰 프록시."""
+    await websocket.accept()
+    settings = websocket.app.state.settings
+    session_factory = websocket.app.state.session_factory
+    client_id = websocket.client.host if websocket.client else "local"
+
+    # 1. 인증 확인
+    session_token = websocket.cookies.get(f"interview_session_{session_id}")
+    if not session_token:
+        logger.warning("WebSocket connection failed: No session token")
+        await websocket.close(code=3000, reason="No session token")
+        return
+
+    try:
+        while True:
+            # 프론트엔드로부터 데이터 수신
+            data = await websocket.receive_json()
+            
+            if data["type"] == "transcript":
+                text = data["text"]
+                mode = data.get("mode", "answer")
+                state_data = data.get("state", {})
+
+                # 비즈니스 로직 연동 (DB 업데이트 및 다음 질문 추출)
+                with session_factory() as db_session:
+                    service = ProjectEvaluationService(ProjectEvaluationRepository(db_session), settings)
+                    flow = InterviewTurnFlow(service)
+                    flow_resp = flow.submit_answer(
+                        evaluation_id,
+                        session_id,
+                        InterviewTurnFlowRequest(
+                            mode=mode,
+                            answer_text=text,
+                            draft_answer=state_data.get("draftAnswer", ""),
+                            follow_up_question=state_data.get("followUpQuestion", ""),
+                            follow_up_reason=state_data.get("followUpReason", ""),
+                            current_question_id=state_data.get("questionId")
+                        ),
+                        session_token,
+                        client_id
+                    )
+
+                # 결과 프론트로 전송 (상태 동기화)
+                await websocket.send_json({
+                    "type": "flow_response",
+                    "payload": flow_resp.model_dump(mode="json")
+                })
+
+                # 다음 질문 또는 꼬리질문을 TTS용 텍스트로 전송
+                next_text = ""
+                if flow_resp.status == "need_follow_up":
+                    next_text = flow_resp.follow_up_question
+                elif flow_resp.next_question:
+                    next_text = flow_resp.next_question.question
+                
+                if next_text:
+                    await websocket.send_json({
+                        "type": "text_response",
+                        "text": next_text
+                    })
+
+            elif data["type"] == "ping":
+                await websocket.send_json({"type": "pong"})
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected for session %s", session_id)
+    except Exception as e:
+        logger.exception("Unexpected error in interview WebSocket: %s", e)
+        if websocket.client_state.name != "DISCONNECTED":
+            await websocket.send_json({"type": "error", "message": str(e)})
 
 
 _STAGED_HTML = """\
@@ -358,7 +443,7 @@ _VOICE_HTML = r'''
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>음성 인터뷰 (Push-to-Talk)</title>
+<title>음성 인터뷰 (OpenAI Realtime)</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 24px 16px; }
@@ -377,11 +462,10 @@ h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; margin-bottom: 4px; }
 .status-bar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #1e293b; border-radius: 10px; }
 .status-dot { width: 12px; height: 12px; border-radius: 50%; background: #64748b; flex-shrink: 0; transition: background .3s; }
 .status-dot.idle { background: #64748b; }
+.status-dot.connected { background: #34d399; }
 .status-dot.speaking { background: #34d399; animation: pulse .8s infinite; }
 .status-dot.recording { background: #f87171; animation: pulse .5s infinite; }
 .status-dot.transcribing { background: #a78bfa; animation: pulse 1s infinite; }
-.status-dot.reviewing { background: #fbbf24; }
-.status-dot.submitting { background: #a78bfa; animation: pulse 1s infinite; }
 .status-dot.error { background: #ef4444; }
 .status-text { font-size: .9rem; color: #94a3b8; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
@@ -390,73 +474,38 @@ h1 { font-size: 1.4rem; font-weight: 700; color: #7dd3fc; margin-bottom: 4px; }
 .question-card .text { font-size: 1.05rem; line-height: 1.55; color: #e2e8f0; white-space: pre-wrap; }
 .follow-up-card { background: #2d1f69; border-radius: 12px; padding: 16px 20px; display: none; }
 .follow-up-card.show { display: block; }
-.follow-up-card .label { font-size: .75rem; font-weight: 600; color: #c4b5fd; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
-.follow-up-card .text { font-size: .95rem; line-height: 1.55; color: #ede9fe; white-space: pre-wrap; }
 .info-card { background: #14532d; border-radius: 12px; padding: 12px 16px; color: #d1fae5; font-size: .88rem; line-height: 1.55; display: none; }
 .info-card.show { display: block; }
-.draft { padding: 10px 14px; background: #0f172a; border: 1px dashed #334155; border-radius: 8px; font-size: .85rem; color: #94a3b8; white-space: pre-wrap; min-height: 1.4rem; display: none; }
-.draft.show { display: block; }
 .transcript-area { display: flex; flex-direction: column; gap: 8px; }
-.transcript-area label { font-size: .8rem; color: #94a3b8; font-weight: 600; }
 textarea { width: 100%; min-height: 110px; resize: vertical; padding: 12px 14px; border-radius: 10px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; font-size: .95rem; font-family: inherit; line-height: 1.5; }
-textarea:focus { outline: none; border-color: #7dd3fc; box-shadow: 0 0 0 2px rgba(125,211,252,.25); }
 .actions { display: flex; gap: 10px; justify-content: space-between; flex-wrap: wrap; align-items: center; }
-.actions .left, .actions .right { display: flex; gap: 10px; flex-wrap: wrap; }
 button { padding: 10px 18px; border: none; border-radius: 8px; font-size: .9rem; font-weight: 600; cursor: pointer; transition: background .15s, opacity .15s; }
 button.primary { background: #2563eb; color: #fff; }
-button.primary:hover { background: #1d4ed8; }
 button.record { background: #16a34a; color: #fff; }
-button.record:hover { background: #15803d; }
 button.record.recording { background: #dc2626; }
-button.record.recording:hover { background: #b91c1c; }
 button.ghost { background: transparent; color: #94a3b8; border: 1px solid #334155; }
-button.ghost:hover { color: #e2e8f0; border-color: #7dd3fc; }
 button.danger { background: #dc2626; color: #fff; }
-button.danger:hover { background: #b91c1c; }
 button:disabled { opacity: .45; cursor: default; }
 .error { padding: 10px 14px; background: #450a0a; border-radius: 8px; color: #fca5a5; font-size: .85rem; display: none; }
 .error.show { display: block; }
-.notice { font-size: .82rem; color: #94a3b8; }
-.notice a { color: #7dd3fc; }
-#report-view { width: 100%; max-width: 820px; display: none; flex-direction: column; gap: 18px; }
-.report-header { padding: 22px; background: #1e293b; border-radius: 14px; text-align: center; }
-.verdict { font-size: 1.7rem; font-weight: 800; margin-bottom: 8px; }
-.verdict.pass { color: #34d399; }
-.verdict.caution { color: #fbbf24; }
-.verdict.fail { color: #f87171; }
-.score-badge { display: inline-block; padding: 4px 14px; border-radius: 18px; font-size: .92rem; font-weight: 600; background: #0f172a; color: #94a3b8; }
-.section { background: #1e293b; border-radius: 12px; padding: 18px; }
-.section h3 { font-size: 1rem; font-weight: 700; color: #7dd3fc; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #1e3a5f; }
-.section p { font-size: .9rem; line-height: 1.7; color: #cbd5e1; }
-table { width: 100%; border-collapse: collapse; font-size: .85rem; }
-th { text-align: left; padding: 8px 10px; background: #0f172a; color: #94a3b8; font-weight: 600; }
-td { padding: 8px 10px; border-top: 1px solid #1e3a5f; color: #cbd5e1; vertical-align: top; }
-ul.bullet { padding-left: 20px; display: flex; flex-direction: column; gap: 4px; }
-ul.bullet li { font-size: .88rem; color: #cbd5e1; line-height: 1.5; }
-.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: .75rem; font-weight: 600; }
-.tag.pass { background: #14532d; color: #86efac; }
-.tag.caution { background: #451a03; color: #fbbf24; }
-.tag.fail { background: #450a0a; color: #f87171; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-@media(max-width: 600px) { .grid2 { grid-template-columns: 1fr; } }
-audio { display: none; }
 </style>
 </head>
 <body>
 <h1>음성 인터뷰</h1>
-<p class="subtitle">버튼을 눌러 녹음하고, 전사 결과를 확인한 뒤 제출하세요. 텍스트로 진행하려면 <a class="notice" id="staged-link" href="#">단계형 화면</a>으로 이동할 수 있습니다.</p>
+<p class="subtitle">OpenAI Realtime SDK Proxy (Text-only) + Client STT/TTS</p>
 
 <div id="main">
   <div class="progress" id="progress">
     <div class="progress-dots" id="progress-dots"></div>
-    <span class="progress-summary" id="progress-summary">세션 상태를 불러오는 중입니다...</span>
+    <span class="progress-summary" id="progress-summary">연결 중...</span>
   </div>
   <div class="status-bar">
     <div class="status-dot idle" id="status-dot"></div>
-    <span class="status-text" id="status-text">대기 중</span>
+    <span class="status-text" id="status-text">서버 연결 중</span>
   </div>
   <div class="error" id="error"></div>
   <div class="info-card" id="info"></div>
+  
   <div class="question-card" id="question-card" style="display:none">
     <div class="label" id="question-label">질문</div>
     <div class="text" id="question-text"></div>
@@ -465,11 +514,10 @@ audio { display: none; }
     <div class="label">꼬리질문</div>
     <div class="text" id="follow-up-text"></div>
   </div>
-  <div class="draft" id="draft"></div>
 
   <div class="actions">
     <div class="left">
-      <button type="button" class="ghost" id="replay-btn" disabled>문제 다시 듣기</button>
+      <button type="button" class="ghost" id="replay-btn" disabled>다시 듣기</button>
     </div>
     <div class="right">
       <button type="button" class="record" id="record-btn" disabled>녹음 시작</button>
@@ -477,32 +525,27 @@ audio { display: none; }
   </div>
 
   <div class="transcript-area">
-    <label for="answer">전사 결과 (직접 수정해도 됩니다)</label>
-    <textarea id="answer" placeholder="여기에 전사된 답변이 표시됩니다. 필요 시 직접 수정한 뒤 '확정 제출'을 눌러주세요."></textarea>
+    <textarea id="answer" placeholder="음성 인식이 시작되면 여기에 텍스트가 표시됩니다."></textarea>
     <div class="actions">
       <div class="left">
-        <button type="button" class="danger" id="end-btn">인터뷰 종료</button>
-        <button type="button" class="ghost" id="skip-btn">이 문제 건너뛰기</button>
+        <button type="button" class="danger" id="end-btn">종료</button>
       </div>
       <div class="right">
-        <button type="button" class="ghost" id="rerecord-btn" disabled>다시 녹음</button>
         <button type="button" class="primary" id="submit-btn" disabled>확정 제출</button>
       </div>
     </div>
   </div>
-
+  
   <audio id="tts-audio" preload="auto"></audio>
 </div>
-
-<div id="report-view"></div>
 
 <script>
 const parts = location.pathname.split('/');
 const EVAL_ID = parts[2];
 const SESSION_ID = parts[3];
 const API_BASE = `/api/project-evaluations/${EVAL_ID}/sessions/${SESSION_ID}/interview`;
-const STAGED_URL = `/interview/${EVAL_ID}/${SESSION_ID}`;
-document.getElementById('staged-link').href = STAGED_URL;
+const WS_PROTOCOL = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const WS_URL = `${WS_PROTOCOL}//${location.host}/interview/${EVAL_ID}/${SESSION_ID}/ws`;
 
 const state = {
   mode: 'answer',
@@ -515,658 +558,301 @@ const state = {
   currentIndex: 0,
 };
 
-let mediaRecorder = null;
-let recorderStream = null;
-let recordedChunks = [];
-let recorderMime = '';
+let socket = null;
+let recognition = null;
 let isRecording = false;
 
 const ttsAudio = document.getElementById('tts-audio');
 
-function esc(s) {
-  return String(s ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+// 오디오 재생 종료 시 상태 복구
+ttsAudio.onended = () => {
+  console.debug("TTS Playback ended");
+  setStatus('idle', '대기 중');
+  readyForRecording();
+};
+
+// 1. WebSocket 초기화 및 에러 로깅 강화
+function initWebSocket() {
+  console.log("Connecting to WebSocket:", WS_URL);
+  socket = new WebSocket(WS_URL);
+
+  socket.onopen = () => {
+    console.log("WebSocket connected.");
+    setStatus('connected', '서버 연결 완료');
+    refreshState();
+  };
+
+  socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    console.debug("WS Message received:", data);
+
+    if (data.type === 'text_response') {
+      // 텍스트가 도착하자마자 즉시 TTS 요청 시작
+      playTts(data.text);
+    } else if (data.type === 'flow_response') {
+      applyFlowResponse(data.payload);
+    } else if (data.type === 'error') {
+      showError("Server error: " + data.message);
+    }
+  };
+
+  socket.onerror = (error) => {
+    console.error("WebSocket Error:", error);
+    showError("WebSocket 통신 오류가 발생했습니다.");
+  };
+
+  socket.onclose = (event) => {
+    let reason = "Unknown reason";
+    if (event.code === 1000) reason = "Normal Closure";
+    else if (event.code === 1001) reason = "Going Away";
+    else if (event.code === 1006) reason = "Abnormal Closure (Network lost)";
+    else if (event.code === 3000) reason = "Authentication Failed (No session token)";
+    else if (event.code === 3001) reason = "Invalid Session";
+    
+    console.warn(`WebSocket closed. Code: ${event.code}, Reason: ${reason}`);
+    setStatus('error', `연결 종료: ${reason}`);
+    
+    if (event.code !== 1000 && event.code !== 3000) {
+      setTimeout(initWebSocket, 3000); // 자동 재연결 시도
+    }
+  };
 }
 
-function renderProgress(currentIndex, total) {
-  const dots = document.getElementById('progress-dots');
-  const summary = document.getElementById('progress-summary');
-  if (!dots || !summary) return;
-  if (!total || total <= 0) {
-    dots.innerHTML = '';
-    summary.textContent = '세션 상태를 불러오는 중입니다...';
+// 2. Client-side STT (Web Speech API)
+function initSTT() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) {
+    showError("이 브라우저는 음성 인식을 지원하지 않습니다.");
     return;
   }
-  const desiredChildren = total + Math.max(0, total - 1);
-  if (dots.childElementCount !== desiredChildren) {
-    dots.innerHTML = '';
-    for (let i = 0; i < total; i += 1) {
-      const dot = document.createElement('span');
-      dot.className = 'dot pending';
-      dot.dataset.idx = String(i);
-      dots.appendChild(dot);
-      if (i < total - 1) {
-        const dash = document.createElement('span');
-        dash.className = 'dash';
-        dash.textContent = '-';
-        dots.appendChild(dash);
+  recognition = new SpeechRecognition();
+  recognition.lang = 'ko-KR';
+  recognition.interimResults = true;
+  recognition.continuous = true;
+
+  recognition.onstart = () => {
+    isRecording = true;
+    setStatus('recording', '녹음 중... 말씀해 주세요.');
+    updateButtons();
+  };
+
+  recognition.onresult = (event) => {
+    let interimTranscript = '';
+    let finalTranscript = '';
+    for (let i = event.resultIndex; i < event.results.length; ++i) {
+      if (event.results[i].isFinal) {
+        finalTranscript += event.results[i][0].transcript;
+      } else {
+        interimTranscript += event.results[i][0].transcript;
       }
     }
-  }
-  const nodes = dots.querySelectorAll('.dot');
-  nodes.forEach((node, i) => {
-    let cls = 'dot pending';
-    if (i < currentIndex) cls = 'dot done';
-    else if (i === currentIndex) cls = 'dot current';
-    node.className = cls;
-  });
-  const safeIndex = Math.max(0, Math.min(currentIndex, total - 1));
-  summary.textContent = `질문 ${safeIndex + 1} / ${total}`;
+    document.getElementById('answer').value = finalTranscript || interimTranscript;
+    syncSubmitButton();
+  };
+
+  recognition.onerror = (event) => {
+    console.error("STT Error:", event.error);
+    showError("음성 인식 오류: " + event.error);
+    stopRecording();
+  };
+
+  recognition.onend = () => {
+    isRecording = false;
+    updateButtons();
+    if (statusText() === '녹음 중... 말씀해 주세요.') {
+        setStatus('idle', '녹음 종료');
+    }
+  };
 }
 
+// 3. Backend High-Quality TTS API (Ultra-low Latency Streaming)
+async function playTts(text) {
+  if (!text) return;
+  
+  // 기존 재생 중지
+  try { 
+    ttsAudio.pause(); 
+    ttsAudio.src = "";
+    ttsAudio.load();
+  } catch(e) {}
+  
+  setStatus('speaking', '인터뷰어가 말하는 중...');
+  document.getElementById('record-btn').disabled = true;
+  document.getElementById('replay-btn').disabled = true;
+  
+  try {
+    const response = await fetch(`${API_BASE}/tts`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    
+    // 스트리밍 재생을 위해 MediaSource 사용
+    if (window.MediaSource) {
+      const mediaSource = new MediaSource();
+      ttsAudio.src = URL.createObjectURL(mediaSource);
+
+      mediaSource.addEventListener('sourceopen', async () => {
+        const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+        const reader = response.body.getReader();
+        
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+              if (mediaSource.readyState === 'open') mediaSource.endOfStream();
+              break;
+            }
+            sourceBuffer.appendBuffer(value);
+            await new Promise(r => sourceBuffer.onupdateend = r);
+            
+            if (ttsAudio.paused) {
+              ttsAudio.play().catch(e => console.debug("Auto-play wait:", e));
+            }
+          }
+        } catch (err) {
+          console.error("Streaming reader error:", err);
+          if (mediaSource.readyState === 'open') mediaSource.endOfStream();
+        }
+      });
+    } else {
+      // Fallback: MediaSource 미지원 시 Blob 방식
+      const blob = await response.blob();
+      ttsAudio.src = URL.createObjectURL(blob);
+      await ttsAudio.play();
+    }
+
+  } catch (err) {
+    console.error("TTS Error:", err);
+    showError("음성 합성 실패: " + err.message);
+    setStatus('idle', '대기 중');
+    readyForRecording();
+  }
+}
+
+// UI Helpers
 function setStatus(kind, text) {
   document.getElementById('status-dot').className = 'status-dot ' + kind;
   document.getElementById('status-text').textContent = text;
 }
-
+function statusText() { return document.getElementById('status-text').textContent; }
 function showError(text) {
   const node = document.getElementById('error');
-  if (!text) {
-    node.classList.remove('show');
-    node.textContent = '';
-    return;
-  }
-  node.classList.add('show');
   node.textContent = text;
+  node.classList.toggle('show', !!text);
 }
-
 function showInfo(text) {
   const node = document.getElementById('info');
-  if (!text) {
-    node.classList.remove('show');
-    node.textContent = '';
-    return;
-  }
-  node.classList.add('show');
   node.textContent = text;
+  node.classList.toggle('show', !!text);
 }
-
 function renderQuestion(text, index, total) {
   const card = document.getElementById('question-card');
-  if (!text) {
-    card.style.display = 'none';
-    return;
-  }
-  card.style.display = 'block';
+  card.style.display = text ? 'block' : 'none';
   document.getElementById('question-label').textContent = `질문 ${index + 1} / ${total}`;
   document.getElementById('question-text').textContent = text;
 }
-
 function renderFollowUp(text) {
   const card = document.getElementById('follow-up-card');
-  if (!text) {
-    card.classList.remove('show');
-    document.getElementById('follow-up-text').textContent = '';
-    return;
-  }
-  card.classList.add('show');
+  card.classList.toggle('show', !!text);
   document.getElementById('follow-up-text').textContent = text;
 }
-
-function renderDraft(text) {
-  const node = document.getElementById('draft');
-  if (!text) {
-    node.classList.remove('show');
-    node.textContent = '';
-    return;
-  }
-  node.classList.add('show');
-  node.textContent = `누적 답변: ${text}`;
+function updateButtons() {
+  const btn = document.getElementById('record-btn');
+  btn.disabled = false;
+  btn.textContent = isRecording ? '녹음 종료' : '녹음 시작';
+  btn.classList.toggle('recording', isRecording);
+}
+function syncSubmitButton() {
+  document.getElementById('submit-btn').disabled = !document.getElementById('answer').value.trim();
 }
 
-function setButtons(opts) {
-  document.getElementById('record-btn').disabled = !opts.canRecord;
-  document.getElementById('rerecord-btn').disabled = !opts.canRerecord;
-  document.getElementById('submit-btn').disabled = !opts.canSubmit;
-  document.getElementById('replay-btn').disabled = !opts.canReplay;
-  document.getElementById('skip-btn').disabled = !opts.canSkip;
-  document.getElementById('end-btn').disabled = !opts.canEnd;
-  const recordBtn = document.getElementById('record-btn');
-  if (isRecording) {
-    recordBtn.classList.add('recording');
-    recordBtn.textContent = '녹음 종료';
-  } else {
-    recordBtn.classList.remove('recording');
-    recordBtn.textContent = '녹음 시작';
-  }
+// Logic
+function startRecording() {
+  try { ttsAudio.pause(); } catch(e) {}
+  if (recognition) recognition.start();
 }
-
-function syncSubmitFromText() {
-  const submitBtn = document.getElementById('submit-btn');
-  if (!submitBtn) return;
-  const answer = document.getElementById('answer');
-  if (!answer) return;
-  if (answer.value && answer.value.trim().length > 0) {
-    submitBtn.disabled = false;
-  }
-}
-
-function disableAllButtons() {
-  setButtons({ canRecord: false, canRerecord: false, canSubmit: false, canReplay: false, canSkip: false, canEnd: false });
-}
-
-function readyForRecording() {
-  setStatus('idle', '녹음 준비 완료. 버튼을 눌러 답변을 시작하세요.');
-  setButtons({ canRecord: true, canRerecord: false, canSubmit: false, canReplay: true, canSkip: true, canEnd: true });
-}
-
-function readyForReview() {
-  setStatus('reviewing', '전사 결과를 검토한 뒤 제출하세요.');
-  setButtons({ canRecord: false, canRerecord: true, canSubmit: true, canReplay: true, canSkip: true, canEnd: true });
-}
-
-async function apiJson(method, path, body) {
-  const init = {
-    method,
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-  };
-  if (body !== undefined) {
-    init.body = JSON.stringify(body);
-  }
-  const res = await fetch(`${API_BASE}${path}`, init);
-  if (!res.ok) {
-    let detail = '';
-    try {
-      const errPayload = await res.json();
-      detail = typeof errPayload.detail === 'string'
-        ? errPayload.detail
-        : JSON.stringify(errPayload.detail || errPayload);
-    } catch (_e) {
-      detail = await res.text();
-    }
-    throw new Error(detail || `HTTP ${res.status}`);
-  }
-  return res.json();
-}
-
-const FOLLOW_UP_FALLBACK_TEXT = '꼬리질문에 답변해 주세요.';
-
-const ttsCache = new Map();
-const ttsInFlight = new Map();
-
-function ttsCacheKey(text) {
-  return String(text || '');
-}
-
-async function fetchTtsBlobNetwork(text) {
-  const res = await fetch(`${API_BASE}/tts`, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
-  });
-  if (!res.ok) {
-    let detail = '';
-    try {
-      const errPayload = await res.json();
-      detail = typeof errPayload.detail === 'string'
-        ? errPayload.detail
-        : JSON.stringify(errPayload.detail || errPayload);
-    } catch (_e) {
-      detail = await res.text();
-    }
-    throw new Error(detail || `TTS HTTP ${res.status}`);
-  }
-  return res.blob();
-}
-
-function fetchTtsBlob(text) {
-  const key = ttsCacheKey(text);
-  if (ttsCache.has(key)) {
-    return Promise.resolve(ttsCache.get(key));
-  }
-  if (ttsInFlight.has(key)) {
-    return ttsInFlight.get(key);
-  }
-  const promise = (async () => {
-    try {
-      const blob = await fetchTtsBlobNetwork(text);
-      ttsCache.set(key, blob);
-      return blob;
-    } finally {
-      ttsInFlight.delete(key);
-    }
-  })();
-  ttsInFlight.set(key, promise);
-  return promise;
-}
-
-function prefetchTts(text) {
-  if (!text) {
-    return;
-  }
-  const key = ttsCacheKey(text);
-  if (ttsCache.has(key) || ttsInFlight.has(key)) {
-    return;
-  }
-  fetchTtsBlob(text).catch(() => {
-    // Prefetch failures stay silent; the real playTts call will surface them.
-  });
-}
-
-let currentTtsResolve = null;
-
-function stopTtsPlayback() {
-  try {
-    ttsAudio.pause();
-  } catch (_e) {
-    /* noop */
-  }
-  if (ttsAudio.src) {
-    try {
-      URL.revokeObjectURL(ttsAudio.src);
-    } catch (_e) {
-      /* noop */
-    }
-    ttsAudio.removeAttribute('src');
-    try {
-      ttsAudio.load();
-    } catch (_e) {
-      /* noop */
-    }
-  }
-  if (currentTtsResolve) {
-    const resolve = currentTtsResolve;
-    currentTtsResolve = null;
-    resolve();
-  }
-}
-
-async function playTts(text) {
-  if (!text) {
-    return;
-  }
-  setStatus('speaking', '인터뷰어가 말하는 중...');
-  setButtons({ canRecord: true, canRerecord: false, canSubmit: false, canReplay: false, canSkip: false, canEnd: true });
-  syncSubmitFromText();
-  const tStart = performance.now();
-  const cacheHit = ttsCache.has(ttsCacheKey(text));
-  try {
-    const blob = await fetchTtsBlob(text);
-    const tBlob = performance.now();
-    const url = URL.createObjectURL(blob);
-    if (ttsAudio.src) {
-      URL.revokeObjectURL(ttsAudio.src);
-    }
-    ttsAudio.src = url;
-    await new Promise((resolve, reject) => {
-      // 외부에서 stopTtsPlayback()이 호출되면 currentTtsResolve를 통해 직접 resolve된다.
-      // 'pause' 이벤트는 src 교체 시 자연 발화될 수 있어 사용하지 않는다.
-      currentTtsResolve = resolve;
-      const onEnded = () => { cleanup(); currentTtsResolve = null; resolve(); };
-      const onError = () => { cleanup(); currentTtsResolve = null; reject(new Error('TTS 오디오 재생 오류')); };
-      function cleanup() {
-        ttsAudio.removeEventListener('ended', onEnded);
-        ttsAudio.removeEventListener('error', onError);
-      }
-      ttsAudio.addEventListener('ended', onEnded);
-      ttsAudio.addEventListener('error', onError);
-      ttsAudio.play().then(() => {
-        const tPlay = performance.now();
-        console.debug(`[tts] blob=${(tBlob - tStart).toFixed(0)}ms play=${(tPlay - tStart).toFixed(0)}ms cache=${cacheHit}`);
-      }).catch((err) => {
-        cleanup();
-        currentTtsResolve = null;
-        reject(err);
-      });
-    });
-  } catch (err) {
-    showError('TTS 재생 실패: ' + (err.message || err));
-  }
-}
-
-function pickRecorderMime() {
-  const candidates = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/mp4',
-    'audio/ogg;codecs=opus',
-    'audio/ogg',
-  ];
-  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) {
-    return '';
-  }
-  for (const mime of candidates) {
-    if (MediaRecorder.isTypeSupported(mime)) {
-      return mime;
-    }
-  }
-  return '';
-}
-
-function mimeToExtension(mime) {
-  if (!mime) return 'webm';
-  if (mime.startsWith('audio/webm')) return 'webm';
-  if (mime.startsWith('audio/mp4')) return 'm4a';
-  if (mime.startsWith('audio/ogg')) return 'ogg';
-  if (mime.startsWith('audio/wav')) return 'wav';
-  return 'webm';
-}
-
-async function ensureMicStream() {
-  if (recorderStream) {
-    return recorderStream;
-  }
-  recorderStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      noiseSuppression: true,
-      echoCancellation: true,
-      autoGainControl: true,
-    },
-  });
-  return recorderStream;
-}
-
-async function startRecording() {
-  showError('');
-  try {
-    const stream = await ensureMicStream();
-    recorderMime = pickRecorderMime();
-    const recorderOpts = recorderMime ? { mimeType: recorderMime } : undefined;
-    mediaRecorder = new MediaRecorder(stream, recorderOpts);
-    recordedChunks = [];
-    mediaRecorder.addEventListener('dataavailable', (event) => {
-      if (event.data && event.data.size > 0) {
-        recordedChunks.push(event.data);
-      }
-    });
-    mediaRecorder.addEventListener('stop', onRecorderStop);
-    mediaRecorder.start();
-    isRecording = true;
-    setStatus('recording', '녹음 중... 답변을 마치면 "녹음 종료"를 누르세요.');
-    setButtons({ canRecord: true, canRerecord: false, canSubmit: false, canReplay: false, canSkip: false, canEnd: true });
-  } catch (err) {
-    isRecording = false;
-    showError('마이크 권한 또는 초기화 실패: ' + (err.message || err));
-    setStatus('error', '마이크 사용 불가. 권한을 확인하거나 단계형 화면을 이용하세요.');
-    setButtons({ canRecord: true, canRerecord: false, canSubmit: false, canReplay: true, canSkip: true, canEnd: true });
-  }
-}
-
 function stopRecording() {
-  if (!mediaRecorder || mediaRecorder.state === 'inactive') {
-    isRecording = false;
-    return;
-  }
-  setStatus('transcribing', '녹음 처리 중...');
-  disableAllButtons();
-  try {
-    mediaRecorder.stop();
-  } catch (_e) {
-    /* noop */
-  }
-}
-
-async function onRecorderStop() {
-  isRecording = false;
-  const blob = new Blob(recordedChunks, { type: recorderMime || 'audio/webm' });
-  recordedChunks = [];
-  if (blob.size === 0) {
-    showError('녹음 데이터가 비어 있습니다. 다시 녹음해 주세요.');
-    readyForRecording();
-    return;
-  }
-  await uploadAndTranscribe(blob);
-}
-
-async function uploadAndTranscribe(blob) {
-  setStatus('transcribing', '음성 전사 중...');
-  showInfo('');
-  try {
-    const ext = mimeToExtension(blob.type || recorderMime);
-    const filename = `answer.${ext}`;
-    const form = new FormData();
-    form.append('audio', blob, filename);
-    form.append('mode', state.mode);
-    const res = await fetch(`${API_BASE}/transcribe`, {
-      method: 'POST',
-      credentials: 'same-origin',
-      body: form,
-    });
-    if (!res.ok) {
-      let detail = '';
-      try {
-        const errPayload = await res.json();
-        detail = typeof errPayload.detail === 'string'
-          ? errPayload.detail
-          : JSON.stringify(errPayload.detail || errPayload);
-      } catch (_e) {
-        detail = await res.text();
-      }
-      throw new Error(detail || `STT HTTP ${res.status}`);
-    }
-    const payload = await res.json();
-    const transcript = payload.transcript || '';
-    document.getElementById('answer').value = transcript;
-    document.getElementById('answer').focus();
-    readyForReview();
-  } catch (err) {
-    showError('음성 전사 실패: ' + (err.message || err));
-    setStatus('error', '전사 실패. 다시 녹음하세요.');
-    setButtons({ canRecord: true, canRerecord: false, canSubmit: false, canReplay: true, canSkip: true, canEnd: true });
-  }
-}
-
-async function submitAnswer(textOverride, modeOverride, opts) {
-  const options = opts || {};
-  const answerText = (textOverride !== undefined ? textOverride : document.getElementById('answer').value).trim();
-  if (!answerText && !options.allowEmpty) {
-    showError('답변 텍스트가 비어 있습니다.');
-    return;
-  }
-  const mode = modeOverride || state.mode;
-  setStatus('submitting', '답변 제출 중...');
-  disableAllButtons();
-  showError('');
-  try {
-    const response = await apiJson('POST', '/answer', {
-      mode,
-      answer_text: answerText,
-      draft_answer: state.draftAnswer,
-      follow_up_question: state.followUpQuestion,
-      follow_up_reason: state.followUpReason,
-      current_question_id: state.questionId,
-    });
-    await applyFlowResponse(response);
-  } catch (err) {
-    showError('답변 제출 실패: ' + (err.message || err));
-    setStatus('error', '제출 실패. 다시 시도하세요.');
-    setButtons({ canRecord: true, canRerecord: true, canSubmit: true, canReplay: true, canSkip: true, canEnd: true });
-  }
-}
-
-async function applyFlowResponse(response) {
-  state.draftAnswer = response.draft_answer || '';
-  state.followUpQuestion = response.follow_up_question || '';
-  state.followUpReason = response.follow_up_reason || '';
-
-  if (response.status === 'need_follow_up') {
-    state.mode = 'follow_up';
-    renderDraft(state.draftAnswer);
-    renderFollowUp(state.followUpQuestion);
-    showInfo(response.message || FOLLOW_UP_FALLBACK_TEXT);
-    document.getElementById('answer').value = '';
-    if (state.followUpQuestion) {
-      prefetchTts(state.followUpQuestion);
-    }
-    await playTts(state.followUpQuestion || FOLLOW_UP_FALLBACK_TEXT);
-    readyForRecording();
-    return;
-  }
-
-  state.draftAnswer = '';
-  state.followUpQuestion = '';
-  state.followUpReason = '';
-  renderDraft('');
-  renderFollowUp('');
-  document.getElementById('answer').value = '';
-
-  if (response.status === 'turn_submitted') {
-    state.mode = 'answer';
-    showInfo(response.message || '');
-    if (response.next_question) {
-      state.questionId = response.next_question.id || null;
-      state.questionText = response.next_question.question || '';
-      state.currentIndex += 1;
-      renderQuestion(state.questionText, state.currentIndex, state.totalQuestions);
-      renderProgress(state.currentIndex, state.totalQuestions);
-      await playTts(state.questionText);
-      readyForRecording();
-    } else {
-      await refreshState();
-    }
-    return;
-  }
-
-  if (response.status === 'ready_to_complete') {
-    showInfo('모든 질문 답변이 저장되었습니다. 리포트를 생성합니다...');
-    await finalizeAndRender();
-    return;
-  }
-
-  if (response.status === 'completed') {
-    await finalizeAndRender();
-  }
-}
-
-function goToReport() {
-  window.location.href = '/interview/' + EVAL_ID + '/' + SESSION_ID + '/report-redirect';
-}
-
-async function finalizeAndRender() {
-  setStatus('submitting', '리포트 생성 중...');
-  try {
-    await apiJson('POST', '/complete', undefined);
-  } catch (err) {
-    // 이미 완료된 세션이면 server가 기존 리포트를 그대로 반환하므로 무시 가능하다.
-    // 그 외 실패는 화면에 표시하지만 리포트 페이지로는 그래도 이동시킨다.
-    showError('리포트 생성 응답 오류: ' + (err.message || err));
-    setStatus('error', '리포트 페이지로 이동합니다.');
-  }
-  goToReport();
+  if (recognition) recognition.stop();
 }
 
 async function refreshState() {
-  showError('');
   try {
-    const stateResp = await apiJson('GET', '/state');
-    state.totalQuestions = stateResp.total_questions || 0;
-    state.currentIndex = stateResp.current_question_index || 0;
-    if (stateResp.is_completed) {
-      await finalizeAndRender();
-      return;
+    const res = await fetch(`${API_BASE}/state`, { credentials: 'same-origin' });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`상태를 불러올 수 없습니다 (HTTP ${res.status}): ${text}`);
     }
-    if (!stateResp.question) {
-      await finalizeAndRender();
-      return;
+    const data = await res.json();
+    state.totalQuestions = data.total_questions || 0;
+    state.currentIndex = data.current_question_index || 0;
+    if (data.is_completed) { 
+      window.location.href = location.pathname.replace('/voice', '/report-redirect'); 
+      return; 
     }
-    state.questionId = stateResp.question.id || null;
-    state.questionText = stateResp.question.question || '';
-    state.mode = 'answer';
-    state.draftAnswer = '';
-    state.followUpQuestion = '';
-    state.followUpReason = '';
+    
+    state.questionId = data.question?.id;
+    state.questionText = data.question?.question || '';
     renderQuestion(state.questionText, state.currentIndex, state.totalQuestions);
-    renderFollowUp('');
-    renderDraft('');
-    renderProgress(state.currentIndex, state.totalQuestions);
-    await playTts(state.questionText);
-    readyForRecording();
+    
+    if (state.questionText) {
+      playTts(state.questionText);
+    }
   } catch (err) {
-    showError('세션 상태 조회 실패: ' + (err.message || err));
-    setStatus('error', '세션 상태를 가져올 수 없습니다.');
+    console.error("refreshState error:", err);
+    showError(err.message);
+    setStatus('error', '질문 로딩 실패');
   }
 }
 
-document.getElementById('record-btn').addEventListener('click', () => {
-  if (isRecording) {
-    stopRecording();
-    return;
-  }
-  // 인터뷰어 TTS 재생 중에 학생이 녹음을 시작하면 TTS는 즉시 중단한다.
-  if (!ttsAudio.paused) {
-    stopTtsPlayback();
-  }
-  startRecording();
-});
+function applyFlowResponse(payload) {
+  state.draftAnswer = payload.draft_answer || '';
+  state.followUpQuestion = payload.follow_up_question || '';
+  state.followUpReason = payload.follow_up_reason || '';
 
-document.getElementById('rerecord-btn').addEventListener('click', () => {
-  document.getElementById('answer').value = '';
-  startRecording();
+  if (payload.status === 'need_follow_up') {
+    state.mode = 'follow_up';
+    renderFollowUp(state.followUpQuestion);
+    playTts(state.followUpQuestion);
+  } else if (payload.status === 'turn_submitted') {
+    state.mode = 'answer';
+    renderFollowUp('');
+    document.getElementById('answer').value = '';
+    refreshState();
+  } else if (payload.status === 'ready_to_complete' || payload.status === 'completed') {
+    window.location.href = location.pathname.replace('/voice', '/report-redirect');
+  }
+}
+
+// Event Listeners
+document.getElementById('record-btn').addEventListener('click', () => {
+  if (isRecording) stopRecording(); else startRecording();
 });
 
 document.getElementById('submit-btn').addEventListener('click', () => {
-  submitAnswer();
+  const text = document.getElementById('answer').value.trim();
+  if (!text) return;
+  socket.send(json({ type: 'transcript', text, mode: state.mode, state }));
+  setStatus('transcribing', '제출 중...');
+  document.getElementById('submit-btn').disabled = true;
 });
 
-document.getElementById('replay-btn').addEventListener('click', async () => {
-  if (state.mode === 'follow_up' && state.followUpQuestion) {
-    await playTts(state.followUpQuestion);
-  } else if (state.questionText) {
-    await playTts(state.questionText);
-  }
-  readyForRecording();
+document.getElementById('replay-btn').addEventListener('click', () => {
+  playTts(state.mode === 'follow_up' ? state.followUpQuestion : state.questionText);
 });
 
-document.getElementById('skip-btn').addEventListener('click', async () => {
-  if (!confirm('이 문제를 건너뛰시겠습니까?')) {
-    return;
-  }
-  await submitAnswer('건너뛰겠습니다', state.mode === 'follow_up' ? 'follow_up' : 'answer');
+document.getElementById('end-btn').addEventListener('click', () => {
+  if (confirm('종료하시겠습니까?')) window.location.href = location.pathname.replace('/voice', '/report-redirect');
 });
 
-document.getElementById('end-btn').addEventListener('click', async () => {
-  if (!confirm('인터뷰를 종료하시겠습니까? 남은 질문은 미응답으로 처리되고, 지금까지의 답변으로 리포트가 작성됩니다.')) {
-    return;
-  }
-  if (!ttsAudio.paused) {
-    stopTtsPlayback();
-  }
-  if (isRecording) {
-    stopRecording();
-  }
-  disableAllButtons();
-  setStatus('submitting', '리포트를 작성하는 중입니다...');
-  showError('');
-  try {
-    await apiJson('POST', '/abort', undefined);
-  } catch (err) {
-    showError('인터뷰 종료 실패: ' + (err.message || err));
-    setStatus('error', '인터뷰 종료 처리에 실패했습니다.');
-    setButtons({ canRecord: false, canRerecord: false, canSubmit: false, canReplay: false, canSkip: false, canEnd: true });
-    return;
-  }
-  goToReport();
-});
+function json(obj) { return JSON.stringify(obj); }
+function readyForRecording() { document.getElementById('record-btn').disabled = false; document.getElementById('replay-btn').disabled = false; }
 
-window.addEventListener('beforeunload', () => {
-  if (recorderStream) {
-    recorderStream.getTracks().forEach((track) => track.stop());
-  }
-});
-
-document.getElementById('answer').addEventListener('input', () => {
-  // 학생이 STT 단계 없이 textarea에 직접 답변을 적었을 때도 제출이 가능해야 한다.
-  syncSubmitFromText();
-});
-
-prefetchTts(FOLLOW_UP_FALLBACK_TEXT);
-
-refreshState();
+initWebSocket();
+initSTT();
 </script>
 </body>
 </html>
@@ -1291,3 +977,4 @@ async def redirect_to_streamlit_report(
         }
     )
     return RedirectResponse(f"{base_url}/?{query}", status_code=303)
+

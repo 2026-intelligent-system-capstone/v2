@@ -6,6 +6,8 @@ class ApiSettings(BaseSettings):
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
     OPENAI_ANALYSIS_MODEL: str = "gpt-4o-mini"
     OPENAI_QUESTION_MODEL: str = "gpt-4o-mini"
+    OPENAI_REALTIME_MODEL: str = "gpt-realtime-2"
+    OPENAI_REALTIME_VOICE: str = "alloy"
     OPENAI_EVAL_MODEL: str = "gpt-4o-mini"
     OPENAI_TRANSCRIBE_MODEL: str = "gpt-4o-transcribe"
     OPENAI_TRANSCRIBE_LANGUAGE: str = "ko"

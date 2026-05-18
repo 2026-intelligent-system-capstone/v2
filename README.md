@@ -27,10 +27,21 @@ uv sync
 
 ### 2. 환경변수 설정
 
+백엔드 실행을 위해 설정 파일이 필요합니다.
+
+**Unix (macOS/Linux):**
 ```bash
 cp .env.example .env
-# .env 파일을 열어 OPENAI_API_KEY 설정
+cp backend/.env.example backend/.env
 ```
+
+**Windows (CMD):**
+```cmd
+copy .env.example .env
+copy backend\.env.example backend\.env
+```
+
+`.env` 파일을 열어 `OPENAI_API_KEY`를 설정하세요.
 
 `.env` 주요 항목:
 
@@ -42,15 +53,25 @@ cp .env.example .env
 
 ### 3. 데이터 디렉터리 생성
 
+백엔드에서 사용할 데이터 저장 폴더를 생성합니다.
+
+**Unix (macOS/Linux):**
 ```bash
-mkdir -p data/artifacts
-touch data/artifacts/.gitkeep
+mkdir -p backend/data/artifacts
+touch backend/data/artifacts/.gitkeep
+```
+
+**Windows (CMD):**
+```cmd
+if not exist "backend\data\artifacts" mkdir "backend\data\artifacts"
+type NUL > backend\data\artifacts\.gitkeep
 ```
 
 ### 4. Qdrant 시작 (선택사항 — RAG 기능 활성화)
 
 ```bash
-make qdrant-up
+# Docker가 설치되어 있어야 합니다.
+docker compose up -d qdrant
 ```
 
 Qdrant 없이도 동작합니다. RAG 없이 rule-based 질문 생성으로 폴백합니다.
@@ -58,23 +79,32 @@ Qdrant 없이도 동작합니다. RAG 없이 rule-based 질문 생성으로 폴�
 ### 5. FastAPI 서버 시작
 
 ```bash
-make api
-# 또는
-uv run uvicorn services.api.app.main:app --reload
+# 공통 (Backend 디렉토리에서 실행)
+cd backend
+uv run uvicorn app.main:app --reload
 ```
 
 서버가 `http://localhost:8000`에서 시작됩니다.
 API 문서: `http://localhost:8000/docs`
 
-### 6. Streamlit UI 시작
+### 6. UI 시작
 
+이 프로젝트는 두 가지 UI를 제공합니다.
+
+#### Streamlit UI (학습용/관리자)
 ```bash
-make streamlit
-# 또는
+# 루트 디렉토리에서 실행
 uv run streamlit run apps/streamlit/Home.py
 ```
-
 브라우저에서 `http://localhost:8501`로 접속합니다.
+
+#### Next.js UI (사용자용)
+```bash
+cd frontend
+pnpm install
+pnpm dev
+```
+브라우저에서 `http://localhost:3000`으로 접속합니다.
 
 ## 사용 흐름
 
@@ -88,22 +118,10 @@ uv run streamlit run apps/streamlit/Home.py
 
 ## 테스트
 
+**백엔드 테스트 실행:**
 ```bash
-# 전체 테스트
-make test
-
-# 통합 테스트만
-uv run pytest services/api/tests/test_evaluation_api.py -v
-```
-
-## 데모 데이터 초기화
-
-```bash
-# DB + 업로드 파일만 초기화
-make reset-demo-data
-
-# Qdrant 컬렉션까지 함께 초기화
-./scripts/reset-demo-data.sh --qdrant
+cd backend
+uv run pytest tests/test_evaluation_api.py -v
 ```
 
 ## 프로젝트 구조
@@ -112,30 +130,23 @@ make reset-demo-data
 v2/
 ├── apps/
 │   └── streamlit/          # Streamlit UI (Home.py, api_client.py)
-├── services/
-│   └── api/
-│       ├── app/
-│       │   ├── project_evaluations/
-│       │   │   ├── analysis/       # context 추출, LLM 클라이언트
-│       │   │   ├── domain/         # Pydantic 모델, DB Row 모델
-│       │   │   ├── ingestion/      # zip 처리, 텍스트 추출
-│       │   │   ├── interview/      # 질문 생성, 답변 평가
-│       │   │   ├── persistence/    # SQLAlchemy repository
-│       │   │   ├── rag/            # Qdrant embedder, retriever
-│       │   │   ├── realtime/       # OpenAI Realtime API 프록시
-│       │   │   └── reports/        # 최종 리포트 생성
-│       │   ├── main.py
-│       │   └── settings.py
-│       └── tests/
-├── data/
-│   ├── app.db              # SQLite3 DB
-│   └── artifacts/          # 업로드 zip 및 추출 파일
-├── docs/
-│   ├── project-evaluation-scope.md
-│   └── tech-stack.md
-├── scripts/
-│   └── reset-demo-data.sh
-├── .env.example
+├── backend/                # FastAPI 백엔드
+│   ├── app/
+│   │   ├── project_evaluations/
+│   │   │   ├── analysis/       # context 추출, LLM 클라이언트
+│   │   │   ├── domain/         # Pydantic 모델, DB Row 모델
+│   │   │   ├── ingestion/      # zip 처리, 텍스트 추출
+│   │   │   ├── interview/      # 질문 생성, 답변 평가
+│   │   │   ├── persistence/    # SQLAlchemy repository
+│   │   │   ├── rag/            # Qdrant embedder, retriever
+│   │   │   ├── realtime/       # OpenAI Realtime API 프록시
+│   │   │   └── reports/        # 최종 리포트 생성
+│   │   ├── main.py
+│   │   └── settings.py
+│   ├── data/               # SQLite3 DB 및 업로드 artifacts
+│   └── tests/
+├── frontend/               # Next.js 프론트엔드
+├── docs/                   # 문서 (scope, tech stack 등)
 ├── Makefile
 └── pyproject.toml
 ```
